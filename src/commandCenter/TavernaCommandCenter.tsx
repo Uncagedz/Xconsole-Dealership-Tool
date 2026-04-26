@@ -97,6 +97,74 @@ type RouteOneDocsStatus = {
   last_decoded_at?: string | null;
 };
 
+type PermissionOption = {
+  id: string;
+  label: string;
+};
+
+type XconsoleUser = {
+  username: string;
+  display_name?: string;
+  role?: 'admin' | 'manager' | 'operator' | string;
+  active?: boolean;
+  permissions?: string[];
+};
+
+type LeadItem = {
+  id: string;
+  customer_name?: string;
+  channel?: string;
+  message?: string;
+  vehicle_vin?: string;
+  status?: string;
+  created_at?: string;
+  last_message_at?: string;
+};
+
+type OfferUpStatus = {
+  ready_for_live?: boolean;
+  mode?: string;
+  reason?: string;
+  drafts_count?: number;
+  posts?: Record<string, unknown>;
+};
+
+type StackStatus = {
+  stack_readiness?: {
+    ready_for_live_facebook_posting?: boolean;
+    components?: {
+      live_requirements?: Record<string, unknown>;
+    };
+  };
+  live_requirements?: Record<string, unknown>;
+  sales_assistant?: {
+    ok?: boolean;
+    banks_count?: number;
+  };
+};
+
+type VinDecodePayload = {
+  ok?: boolean;
+  source?: string;
+  fields?: {
+    year?: string | number | null;
+    make?: string | null;
+    model?: string | null;
+    trim?: string | null;
+    body_class?: string | null;
+    drive_type?: string | null;
+    engine?: string | null;
+  };
+};
+
+type VehicleBankBrainPayload = {
+  default_structure?: StructurePayload['structure'];
+  recommendation?: BankRecommendation & { collateral_flags?: string[] };
+  packet_guidance?: string[];
+  assumptions?: string[];
+  carfax_summary?: Record<string, unknown> | null;
+};
+
 type OneClickPostPayload = {
   post_result?: {
     mode?: 'live' | 'draft';
@@ -114,6 +182,17 @@ type VehicleTitleParts = {
 };
 
 const THUMBNAIL_SKIP = [0, 2];
+const DEFAULT_PERMISSION_OPTIONS: PermissionOption[] = [
+  { id: 'inventory.view', label: 'Inventory' },
+  { id: 'inventory.edit', label: 'Edit Cars' },
+  { id: 'facebook.post', label: 'Facebook Post' },
+  { id: 'facebook.leads', label: 'Messenger Leads' },
+  { id: 'offerup.post', label: 'OfferUp' },
+  { id: 'bankbrain.view', label: 'Bank Brain' },
+  { id: 'bankbrain.train', label: 'Train Banks' },
+  { id: 'users.manage', label: 'Users' },
+  { id: 'admin.full', label: 'Admin' },
+];
 
 function vin(value: string | undefined | null): string {
   return String(value || '').trim().toUpperCase();
@@ -345,14 +424,26 @@ export function TavernaCommandCenter() {
   async function refresh() {
     setRefreshBusy(true);
     try {
-      const [vehicles, accountsRes, postsRes] = await Promise.all([
+      const [vehicles, accountsRes, postsRes, meRes, usersRes, leadsRes, offerupRes, statusRes] = await Promise.all([
         requestJson<VehiclesPayload>('/api/vehicles'),
         requestJson<{ items?: Account[] }>('/api/facebook/accounts'),
         requestJson<{ items?: PostLog[] }>('/api/facebook/posts'),
+        requestJson<{ user?: XconsoleUser; permissions?: PermissionOption[] }>('/api/me').catch(() => ({ user: null, permissions: DEFAULT_PERMISSION_OPTIONS })),
+        requestJson<{ items?: XconsoleUser[]; permissions?: PermissionOption[] }>('/api/admin/users').catch(() => ({ items: [] })),
+        requestJson<{ items?: LeadItem[] }>('/api/leads/inbox').catch(() => ({ items: [] })),
+        requestJson<OfferUpStatus>('/api/offerup/status').catch(() => null),
+        requestJson<StackStatus>('/api/status').catch(() => null),
       ]);
       const items = Array.isArray(vehicles.items) ? vehicles.items : [];
       setInventory(items);
       setSourceStatus(vehicles.source_status || null);
+      setMe(meRes.user || null);
+      if (Array.isArray(meRes.permissions)) setPermissionOptions(meRes.permissions);
+      if (Array.isArray(usersRes.items)) setUsers(usersRes.items);
+      if (Array.isArray(usersRes.permissions)) setPermissionOptions(usersRes.permissions);
+      setLeads(Array.isArray(leadsRes.items) ? leadsRes.items : []);
+      setOfferup(offerupRes);
+      setStackStatus(statusRes);
       if (!dealershipUrl && vehicles.source_status?.configured_url) {
         setDealershipUrl(String(vehicles.source_status.configured_url));
       }
@@ -447,6 +538,208 @@ export function TavernaCommandCenter() {
   const [routeoneBank, setRouteoneBank] = useState('');
   const [routeoneFiles, setRouteoneFiles] = useState<FileList | null>(null);
   const [routeoneBusy, setRouteoneBusy] = useState(false);
+  const [me, setMe] = useState<XconsoleUser | null>(null);
+  const [users, setUsers] = useState<XconsoleUser[]>([]);
+  const [permissionOptions, setPermissionOptions] = useState<PermissionOption[]>(DEFAULT_PERMISSION_OPTIONS);
+  const [newUser, setNewUser] = useState({
+    username: '',
+    password: '',
+    display_name: '',
+    role: 'operator',
+    permissions: ['inventory.view', 'facebook.post', 'facebook.leads', 'offerup.post', 'bankbrain.view'],
+    active: true,
+  });
+  const [leads, setLeads] = useState<LeadItem[]>([]);
+  const [leadDrafts, setLeadDrafts] = useState<Record<string, string>>({});
+  const [manualLead, setManualLead] = useState({ customer_name: '', message: '', vehicle_vin: '', channel: 'facebook' });
+  const [offerup, setOfferup] = useState<OfferUpStatus | null>(null);
+  const [stackStatus, setStackStatus] = useState<StackStatus | null>(null);
+  const [vinDecode, setVinDecode] = useState<VinDecodePayload | null>(null);
+  const [vehicleBrain, setVehicleBrain] = useState<VehicleBankBrainPayload | null>(null);
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [leadBusy, setLeadBusy] = useState(false);
+  const [offerupBusy, setOfferupBusy] = useState(false);
+  const [intelBusy, setIntelBusy] = useState(false);
+
+  function can(permission: string): boolean {
+    const permissions = new Set(me?.permissions || []);
+    return permissions.has('admin.full') || permissions.has(permission);
+  }
+
+  function toggleNewUserPermission(permission: string) {
+    setNewUser((previous) => {
+      const current = new Set(previous.permissions);
+      if (current.has(permission)) current.delete(permission);
+      else current.add(permission);
+      return { ...previous, permissions: Array.from(current) };
+    });
+  }
+
+  async function saveUser() {
+    if (!newUser.username.trim() || !newUser.password.trim()) {
+      setStatusText('Username and password are required for a new user.');
+      return;
+    }
+    setAdminBusy(true);
+    try {
+      const payload = await requestJson<{ items?: XconsoleUser[] }>('/api/admin/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newUser),
+      });
+      setUsers(Array.isArray(payload.items) ? payload.items : []);
+      setNewUser({
+        username: '',
+        password: '',
+        display_name: '',
+        role: 'operator',
+        permissions: ['inventory.view', 'facebook.post', 'facebook.leads', 'offerup.post', 'bankbrain.view'],
+        active: true,
+      });
+      setStatusText('User access saved.');
+    } catch (error: unknown) {
+      setStatusText(`User save failed: ${String(error)}`);
+    } finally {
+      setAdminBusy(false);
+    }
+  }
+
+  async function toggleExistingUserPermission(user: XconsoleUser, permission: string) {
+    if (!user.username) return;
+    const current = new Set(user.permissions || []);
+    if (current.has(permission)) current.delete(permission);
+    else current.add(permission);
+    setAdminBusy(true);
+    try {
+      const payload = await requestJson<{ items?: XconsoleUser[] }>(`/api/admin/users/${encodeURIComponent(user.username)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: user.username,
+          display_name: user.display_name || user.username,
+          role: user.role || 'operator',
+          permissions: Array.from(current),
+          active: user.active !== false,
+        }),
+      });
+      setUsers(Array.isArray(payload.items) ? payload.items : []);
+      setStatusText(`Permissions updated for ${user.username}.`);
+    } catch (error: unknown) {
+      setStatusText(`Permission update failed: ${String(error)}`);
+    } finally {
+      setAdminBusy(false);
+    }
+  }
+
+  async function addManualLead() {
+    const message = manualLead.message.trim();
+    if (!message) {
+      setStatusText('Lead message is required.');
+      return;
+    }
+    setLeadBusy(true);
+    try {
+      const payload = await requestJson<{ items?: LeadItem[] }>('/api/leads/manual-add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...manualLead,
+          customer_name: manualLead.customer_name || 'Unknown Lead',
+          vehicle_vin: manualLead.vehicle_vin || vin(selectedVin),
+        }),
+      });
+      setLeads(Array.isArray(payload.items) ? payload.items : []);
+      setManualLead({ customer_name: '', message: '', vehicle_vin: '', channel: 'facebook' });
+      setStatusText('Lead added to inbox.');
+    } catch (error: unknown) {
+      setStatusText(`Lead add failed: ${String(error)}`);
+    } finally {
+      setLeadBusy(false);
+    }
+  }
+
+  async function respondToLead(lead: LeadItem) {
+    const responseText =
+      leadDrafts[lead.id]?.trim() ||
+      `Thanks for reaching out. I can help with ${lead.vehicle_vin || selected?.title || 'this vehicle'} today.`;
+    setLeadBusy(true);
+    try {
+      const payload = await requestJson<{ items?: LeadItem[] }>('/api/leads/respond', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lead_id: lead.id,
+          response_text: responseText,
+          channel: lead.channel || 'facebook',
+          mark_status: 'responded',
+        }),
+      });
+      setLeads(Array.isArray(payload.items) ? payload.items : []);
+      setLeadDrafts((previous) => ({ ...previous, [lead.id]: '' }));
+      setStatusText('Lead response logged.');
+    } catch (error: unknown) {
+      setStatusText(`Lead response failed: ${String(error)}`);
+    } finally {
+      setLeadBusy(false);
+    }
+  }
+
+  async function syncFacebookLeads() {
+    setLeadBusy(true);
+    try {
+      const payload = await requestJson<{ items?: LeadItem[]; mode?: string; guidance?: string[] }>('/api/leads/sync-facebook', {
+        method: 'POST',
+      });
+      setLeads(Array.isArray(payload.items) ? payload.items : []);
+      setStatusText(payload.guidance?.[0] || `Facebook lead sync: ${payload.mode || 'complete'}`);
+    } catch (error: unknown) {
+      setStatusText(`Facebook lead sync failed: ${String(error)}`);
+    } finally {
+      setLeadBusy(false);
+    }
+  }
+
+  async function offerupPost(modeOverride: 'draft' | 'live' = 'draft') {
+    const clean = vin(selectedVin);
+    if (!clean) {
+      setStatusText('Select a vehicle before creating an OfferUp post.');
+      return;
+    }
+    setOfferupBusy(true);
+    try {
+      const payload = await requestJson<{ status?: OfferUpStatus; live_detail?: string }>('/api/offerup/post/from-inventory', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          vin: clean,
+          mode: modeOverride,
+          caption_override: enhancedCaption,
+        }),
+      });
+      setOfferup(payload.status || null);
+      setStatusText(modeOverride === 'draft' ? `OfferUp draft created for ${clean}.` : payload.live_detail || 'OfferUp live attempt finished.');
+    } catch (error: unknown) {
+      setStatusText(`OfferUp failed: ${String(error)}`);
+    } finally {
+      setOfferupBusy(false);
+    }
+  }
+
+  async function loadVehicleIntel(targetVin: string) {
+    const clean = vin(targetVin);
+    if (!clean) return;
+    setIntelBusy(true);
+    try {
+      const [decodeRes, brainRes] = await Promise.all([
+        requestJson<VinDecodePayload>(`/api/vehicles/${encodeURIComponent(clean)}/decode`).catch(() => null),
+        requestJson<VehicleBankBrainPayload>(`/api/bank-brain/vehicle/${encodeURIComponent(clean)}`).catch(() => null),
+      ]);
+      setVinDecode(decodeRes);
+      setVehicleBrain(brainRes);
+    } finally {
+      setIntelBusy(false);
+    }
+  }
 
   const postedVinSet = useMemo(() => {
     const ids = new Set<string>();
@@ -460,9 +753,12 @@ export function TavernaCommandCenter() {
   const bestBank = structure?.recommendation?.best_bank || analysis?.recommendation?.best_bank;
   const backupBank = structure?.recommendation?.backup_bank || analysis?.recommendation?.backup_bank;
   const rankedBanks = structure?.recommendation?.ranked_banks || analysis?.recommendation?.ranked_banks || [];
+  const vehicleBestBank = vehicleBrain?.recommendation?.best_bank;
+  const vehicleBackupBank = vehicleBrain?.recommendation?.backup_bank;
   const riskFlags = [
     ...(analysis?.recommendation?.high_risk_flags || []),
     ...(structure?.recommendation?.high_risk_flags || []),
+    ...(vehicleBrain?.recommendation?.collateral_flags || []),
   ];
   const suggestions = [
     ...(analysis?.recommendation?.suggested_changes || []),
@@ -583,7 +879,7 @@ export function TavernaCommandCenter() {
   }
 
   async function logDecision(outcome: 'approved' | 'declined' | 'countered') {
-    const bankCode = bestBank?.bank_code || backupBank?.bank_code;
+    const bankCode = bestBank?.bank_code || vehicleBestBank?.bank_code || backupBank?.bank_code || vehicleBackupBank?.bank_code;
     if (!bankCode) {
       setStatusText('No lender recommendation available.');
       return;
@@ -814,6 +1110,11 @@ export function TavernaCommandCenter() {
   }, [assetsByVin, selectedVin]);
 
   useEffect(() => {
+    if (!vin(selectedVin)) return;
+    void loadVehicleIntel(selectedVin);
+  }, [selectedVin]);
+
+  useEffect(() => {
     setCaption(defaultCaption(selected));
   }, [selected]);
 
@@ -840,7 +1141,11 @@ export function TavernaCommandCenter() {
   const selectedPosted = Boolean(selected?.posted || (selected ? postedVinSet.has(vin(selected.vin)) : false));
   const selectedInCredit = selected ? Boolean(inCreditByVin[vin(selected.vin)]) : false;
   const selectedSubmitted = selected ? Boolean(submittedByVin[vin(selected.vin)]) : false;
-  const approvalProbability = bestBank ? `${bestBank.confidence.toFixed(1)}%` : 'n/a';
+  const approvalProbability = bestBank
+    ? `${bestBank.confidence.toFixed(1)}%`
+    : vehicleBestBank
+      ? `${vehicleBestBank.confidence.toFixed(1)}%`
+      : 'n/a';
   const selectedTitleParts = useMemo(() => parseVehicleTitleParts(selected), [selected]);
   const selectedPhotosResolved = useMemo(() => resolveVehiclePhotos(selected, selectedAssets), [selected, selectedAssets]);
 
@@ -1009,6 +1314,9 @@ export function TavernaCommandCenter() {
           />
         </label>
         <div className="tv2-top-actions">
+          <span className="tv2-chip">User {me?.username || 'admin'}</span>
+          <span className="tv2-chip">Leads {leads.length}</span>
+          <span className="tv2-chip">OfferUp {offerup?.drafts_count ?? 0}</span>
           <span className="tv2-chip">FB Accounts {accounts.length}</span>
           <span className="tv2-chip">Banks {bankProfiles.length}</span>
           <span className="tv2-chip">RouteOne Docs {routeoneDocs?.doc_count ?? 0}</span>
@@ -1083,6 +1391,204 @@ export function TavernaCommandCenter() {
           <h3>Finance Live</h3>
           <p>{inventoryStats.financeLiveCount}</p>
           <small>Bank Brain active</small>
+        </article>
+      </section>
+
+      <section className="tv2-operator-grid">
+        <article className="tv2-console-card tv2-access-card">
+          <div className="tv2-card-head">
+            <div>
+              <h3>Access Control</h3>
+              <p>Feature gates for posting, leads, OfferUp, and Bank Brain.</p>
+            </div>
+            <span className={`tv2-badge${can('users.manage') ? ' ok' : ' warn'}`}>
+              {can('users.manage') ? 'Admin' : 'Limited'}
+            </span>
+          </div>
+          {can('users.manage') ? (
+            <>
+              <div className="tv2-user-list">
+                {users.slice(0, 4).map((user) => (
+                  <div className="tv2-user-row" key={user.username}>
+                    <div>
+                      <strong>{user.display_name || user.username}</strong>
+                      <span>{user.username} | {user.role || 'operator'} | {user.active === false ? 'disabled' : 'active'}</span>
+                    </div>
+                    <div className="tv2-permission-wrap">
+                      {permissionOptions.map((permission) => (
+                        <button
+                          className={`tv2-permission-pill${user.permissions?.includes(permission.id) ? ' is-on' : ''}`}
+                          key={`${user.username}-${permission.id}`}
+                          type="button"
+                          onClick={() => void toggleExistingUserPermission(user, permission.id)}
+                          disabled={adminBusy || user.role === 'admin'}
+                        >
+                          {permission.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="tv2-mini-form">
+                <input value={newUser.username} onChange={(event) => setNewUser((prev) => ({ ...prev, username: event.target.value }))} placeholder="username" />
+                <input value={newUser.password} onChange={(event) => setNewUser((prev) => ({ ...prev, password: event.target.value }))} placeholder="password" type="password" />
+                <input value={newUser.display_name} onChange={(event) => setNewUser((prev) => ({ ...prev, display_name: event.target.value }))} placeholder="display name" />
+                <select value={newUser.role} onChange={(event) => setNewUser((prev) => ({ ...prev, role: event.target.value }))}>
+                  <option value="operator">Operator</option>
+                  <option value="manager">Manager</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </div>
+              <div className="tv2-permission-wrap">
+                {permissionOptions.map((permission) => (
+                  <button
+                    className={`tv2-permission-pill${newUser.permissions.includes(permission.id) ? ' is-on' : ''}`}
+                    key={`new-${permission.id}`}
+                    type="button"
+                    onClick={() => toggleNewUserPermission(permission.id)}
+                  >
+                    {permission.label}
+                  </button>
+                ))}
+              </div>
+              <button className="tv2-btn tv2-btn-primary" type="button" onClick={() => void saveUser()} disabled={adminBusy}>
+                {adminBusy ? 'Saving...' : 'Add User'}
+              </button>
+            </>
+          ) : (
+            <p className="tv2-empty">Your current user can use assigned tools but cannot manage access.</p>
+          )}
+        </article>
+
+        <article className="tv2-console-card">
+          <div className="tv2-card-head">
+            <div>
+              <h3>Lead Inbox</h3>
+              <p>Messenger-style responses stay next to inventory.</p>
+            </div>
+            <button className="tv2-btn" type="button" onClick={() => void syncFacebookLeads()} disabled={leadBusy || !can('facebook.leads')}>
+              {leadBusy ? 'Working...' : 'Sync FB'}
+            </button>
+          </div>
+          <div className="tv2-mini-form tv2-mini-form-leads">
+            <input value={manualLead.customer_name} onChange={(event) => setManualLead((prev) => ({ ...prev, customer_name: event.target.value }))} placeholder="lead name" />
+            <input value={manualLead.vehicle_vin || vin(selectedVin)} onChange={(event) => setManualLead((prev) => ({ ...prev, vehicle_vin: event.target.value }))} placeholder="VIN" />
+            <input value={manualLead.message} onChange={(event) => setManualLead((prev) => ({ ...prev, message: event.target.value }))} placeholder="message from buyer" />
+            <button className="tv2-btn tv2-btn-primary" type="button" onClick={() => void addManualLead()} disabled={leadBusy || !can('facebook.leads')}>
+              Add
+            </button>
+          </div>
+          <div className="tv2-lead-list">
+            {leads.slice(0, 4).map((lead) => (
+              <article className="tv2-lead-item" key={lead.id}>
+                <div>
+                  <strong>{lead.customer_name || 'Unknown Lead'}</strong>
+                  <span>{lead.channel || 'facebook'} | {lead.vehicle_vin || 'no VIN'} | {lead.status || 'new'}</span>
+                  <p>{lead.message || 'No message text captured.'}</p>
+                </div>
+                <textarea
+                  value={leadDrafts[lead.id] || ''}
+                  onChange={(event) => setLeadDrafts((prev) => ({ ...prev, [lead.id]: event.target.value }))}
+                  placeholder="type response"
+                />
+                <button className="tv2-btn tv2-btn-primary" type="button" onClick={() => void respondToLead(lead)} disabled={leadBusy || !can('facebook.leads')}>
+                  Respond
+                </button>
+              </article>
+            ))}
+            {!leads.length ? <p className="tv2-empty">No captured leads yet. Use Add or connect Facebook Page credentials.</p> : null}
+          </div>
+        </article>
+
+        <article className="tv2-console-card">
+          <div className="tv2-card-head">
+            <div>
+              <h3>Marketplace Command</h3>
+              <p>One selected vehicle controls Facebook and OfferUp.</p>
+            </div>
+            <span className={`tv2-badge${stackStatus?.stack_readiness?.ready_for_live_facebook_posting ? ' ok' : ' warn'}`}>
+              {stackStatus?.stack_readiness?.ready_for_live_facebook_posting ? 'FB Live Ready' : 'FB Needs Setup'}
+            </span>
+          </div>
+          <div className="tv2-market-grid">
+            <div>
+              <span>Selected VIN</span>
+              <strong>{vin(selectedVin) || 'none'}</strong>
+            </div>
+            <div>
+              <span>Photos selected</span>
+              <strong>{selectedPhotoIndexes.length}</strong>
+            </div>
+            <div>
+              <span>OfferUp drafts</span>
+              <strong>{offerup?.drafts_count ?? 0}</strong>
+            </div>
+            <div>
+              <span>Facebook account</span>
+              <strong>{accountId || 'default'}</strong>
+            </div>
+          </div>
+          <div className="tv2-split-actions">
+            <button className="tv2-btn tv2-btn-primary" type="button" onClick={() => void post('live')} disabled={postBusy || !selected || !can('facebook.post')}>
+              Post Facebook
+            </button>
+            <button className="tv2-btn" type="button" onClick={() => void post('draft')} disabled={postBusy || !selected || !can('facebook.post')}>
+              FB Draft
+            </button>
+            <button className="tv2-btn tv2-btn-primary" type="button" onClick={() => void offerupPost('draft')} disabled={offerupBusy || !selected || !can('offerup.post')}>
+              OfferUp Draft
+            </button>
+            <button className="tv2-btn" type="button" onClick={() => void offerupPost('live')} disabled={offerupBusy || !selected || !can('offerup.post')}>
+              OfferUp Live Check
+            </button>
+          </div>
+          <p className="tv2-muted-note">{offerup?.reason || 'OfferUp creates operator-ready drafts until live session automation is connected.'}</p>
+        </article>
+
+        <article className="tv2-console-card">
+          <div className="tv2-card-head">
+            <div>
+              <h3>VIN + Bank Brain</h3>
+              <p>Collateral-aware lender suggestion before credit upload.</p>
+            </div>
+            <button className="tv2-btn" type="button" onClick={() => selectedVin && void loadVehicleIntel(selectedVin)} disabled={intelBusy || !selectedVin}>
+              {intelBusy ? 'Reading...' : 'Reload VIN'}
+            </button>
+          </div>
+          <div className="tv2-intel-grid">
+            <div>
+              <span>Decoded</span>
+              <strong>
+                {[vinDecode?.fields?.year, vinDecode?.fields?.make, vinDecode?.fields?.model].filter(Boolean).join(' ') || selected?.title || 'n/a'}
+              </strong>
+            </div>
+            <div>
+              <span>Body / Drive</span>
+              <strong>{[vinDecode?.fields?.body_class, vinDecode?.fields?.drive_type].filter(Boolean).join(' / ') || 'n/a'}</strong>
+            </div>
+            <div>
+              <span>Primary Bank</span>
+              <strong>{vehicleBestBank?.bank_name || bestBank?.bank_name || 'needs structure'}</strong>
+            </div>
+            <div>
+              <span>Probability</span>
+              <strong>{approvalProbability}</strong>
+            </div>
+            <div>
+              <span>LTV</span>
+              <strong>{vehicleBrain?.default_structure?.ltv ?? structure?.structure?.ltv ?? 'n/a'}%</strong>
+            </div>
+            <div>
+              <span>Backup</span>
+              <strong>{vehicleBackupBank?.bank_name || backupBank?.bank_name || 'n/a'}</strong>
+            </div>
+          </div>
+          <div className="tv2-pill-wrap">
+            {(vehicleBrain?.recommendation?.collateral_flags?.length ? vehicleBrain.recommendation.collateral_flags : vehicleBrain?.packet_guidance || ['Upload credit report for bureau-specific recommendation.'])
+              .slice(0, 3)
+              .map((item, index) => <span className="tv2-pill" key={`intel-${index}`}>{item}</span>)}
+          </div>
         </article>
       </section>
 
@@ -1334,11 +1840,11 @@ export function TavernaCommandCenter() {
                     <article className="tv2-card tv2-bank-snapshot-card">
                       <div className="tv2-card-head">
                         <h3>Bank Brain Snapshot</h3>
-                        <span className={`tv2-badge${bestBank ? ' ok' : ' warn'}`}>{bestBank ? 'Live' : 'Pending'}</span>
+                      <span className={`tv2-badge${bestBank || vehicleBestBank ? ' ok' : ' warn'}`}>{bestBank || vehicleBestBank ? 'Live' : 'Pending'}</span>
                       </div>
                       <p className="tv2-bank-snapshot-score">{approvalProbability}</p>
-                      <p>Primary lender: {bestBank?.bank_name || 'n/a'}</p>
-                      <p>Backup lender: {backupBank?.bank_name || 'n/a'}</p>
+                      <p>Primary lender: {bestBank?.bank_name || vehicleBestBank?.bank_name || 'n/a'}</p>
+                      <p>Backup lender: {backupBank?.bank_name || vehicleBackupBank?.bank_name || 'n/a'}</p>
                       <p>Risk flags: {riskFlags.length ? riskFlags.slice(0, 2).join(' | ') : 'none'}</p>
                     </article>
                   </section>
@@ -1607,11 +2113,11 @@ export function TavernaCommandCenter() {
                       <article className="tv2-card tv2-approval-card">
                         <div className="tv2-card-head">
                           <h3>Approval Probability</h3>
-                          <span className={`tv2-badge${bestBank ? ' ok' : ' warn'}`}>{bestBank ? 'Live' : 'Pending'}</span>
+                          <span className={`tv2-badge${bestBank || vehicleBestBank ? ' ok' : ' warn'}`}>{bestBank || vehicleBestBank ? 'Live' : 'Pending'}</span>
                         </div>
                         <p className="tv2-approval-score">{approvalProbability}</p>
-                        <p>Primary lender: {bestBank?.bank_name || 'n/a'}</p>
-                        <p>Backup lender: {backupBank?.bank_name || 'n/a'}</p>
+                        <p>Primary lender: {bestBank?.bank_name || vehicleBestBank?.bank_name || 'n/a'}</p>
+                        <p>Backup lender: {backupBank?.bank_name || vehicleBackupBank?.bank_name || 'n/a'}</p>
                       </article>
 
                       <article className="tv2-card">
@@ -1657,8 +2163,8 @@ export function TavernaCommandCenter() {
                           <label><span>Term</span><input value={structureForm.term} onChange={(event) => setStructureForm((prev) => ({ ...prev, term: event.target.value }))} /></label>
                         </div>
                         <div className="tv2-metric-strip tv2-structuring-strip">
-                          <article><h4>Best Bank</h4><p>{bestBank?.bank_name || 'n/a'}</p></article>
-                          <article><h4>Backup</h4><p>{backupBank?.bank_name || 'n/a'}</p></article>
+                          <article><h4>Best Bank</h4><p>{bestBank?.bank_name || vehicleBestBank?.bank_name || 'n/a'}</p></article>
+                          <article><h4>Backup</h4><p>{backupBank?.bank_name || vehicleBackupBank?.bank_name || 'n/a'}</p></article>
                           <article><h4>Financed</h4><p>{money(structure?.structure?.financed_amount ?? null)}</p></article>
                           <article><h4>Payment</h4><p>{money(structure?.structure?.estimated_payment ?? null)}</p></article>
                         </div>
@@ -1672,8 +2178,8 @@ export function TavernaCommandCenter() {
                           </button>
                         </div>
                         <div className="tv2-bank-reco-grid">
-                          <article><h4>Primary Lender</h4><p>{bestBank?.bank_name || 'n/a'}</p><small>{bestBank ? `${bestBank.confidence.toFixed(1)}%` : ''}</small></article>
-                          <article><h4>Backup Lender</h4><p>{backupBank?.bank_name || 'n/a'}</p><small>{backupBank ? `${backupBank.confidence.toFixed(1)}%` : ''}</small></article>
+                          <article><h4>Primary Lender</h4><p>{bestBank?.bank_name || vehicleBestBank?.bank_name || 'n/a'}</p><small>{bestBank ? `${bestBank.confidence.toFixed(1)}%` : vehicleBestBank ? `${vehicleBestBank.confidence.toFixed(1)}%` : ''}</small></article>
+                          <article><h4>Backup Lender</h4><p>{backupBank?.bank_name || vehicleBackupBank?.bank_name || 'n/a'}</p><small>{backupBank ? `${backupBank.confidence.toFixed(1)}%` : vehicleBackupBank ? `${vehicleBackupBank.confidence.toFixed(1)}%` : ''}</small></article>
                         </div>
                         <div className="tv2-advice-grid">
                           <article><h4>Risk Flags</h4><ul>{(riskFlags.length ? riskFlags : ['none']).map((item, i) => <li key={`risk-${i}`}>{item}</li>)}</ul></article>

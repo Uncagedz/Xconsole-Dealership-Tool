@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import base64
-import os
-import secrets
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -14,6 +11,7 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from .api import router as api_router
+from .security import authenticate_basic_header
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT_DIR = APP_DIR.parent
@@ -37,26 +35,10 @@ app.include_router(api_router, prefix="/api")
 
 @app.middleware("http")
 async def optional_basic_auth(request: Request, call_next):
-    username = os.getenv("XCONSOLE_BASIC_AUTH_USER", "").strip()
-    password = os.getenv("XCONSOLE_BASIC_AUTH_PASSWORD", "").strip()
-    if not username or not password or request.url.path == "/api/health":
+    if request.url.path == "/api/health":
         return await call_next(request)
 
-    auth_header = request.headers.get("authorization", "")
-    scheme, _, token = auth_header.partition(" ")
-    valid = False
-    if scheme.lower() == "basic" and token:
-        try:
-            decoded = base64.b64decode(token).decode("utf-8")
-            supplied_username, _, supplied_password = decoded.partition(":")
-            valid = secrets.compare_digest(supplied_username, username) and secrets.compare_digest(
-                supplied_password,
-                password,
-            )
-        except Exception:
-            valid = False
-
-    if valid:
+    if authenticate_basic_header(request.headers.get("authorization", "")):
         return await call_next(request)
 
     return Response(

@@ -16,8 +16,16 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
+
+from .security import (
+    DEFAULT_PERMISSIONS,
+    current_user_from_auth_header,
+    deactivate_user,
+    list_public_users,
+    upsert_user,
+)
 
 try:
     from selenium import webdriver
@@ -55,6 +63,15 @@ BANK_DOCS_ROOT = Path(os.getenv("BANK_DOCS_ROOT", str(ROOT_DIR / "Bank"))).resol
 BANK_DOCS_DECODED_DIR = RUNTIME_DIR / "routeone_docs" / "decoded"
 BANK_DOCS_INDEX_PATH = RUNTIME_DIR / "routeone_docs" / "decoded_index.json"
 BANK_DOCS_LINK_CACHE_DIR = RUNTIME_DIR / "routeone_docs" / "linked_cache"
+XCONSOLE_STATE_DIR = Path(
+    os.getenv("XCONSOLE_STATE_DIR", str(BANK_DOCS_ROOT / "_xconsole"))
+).resolve()
+LEADS_PATH = DATA_DIR / "post_lead" / "leads.json"
+LEAD_RESPONSES_PATH = XCONSOLE_STATE_DIR / "lead_responses.json"
+OFFERUP_STATUS_PATH = XCONSOLE_STATE_DIR / "offerup_status.json"
+OFFERUP_POSTS_DIR = XCONSOLE_STATE_DIR / "offerup_posts"
+VIN_DECODE_CACHE_DIR = XCONSOLE_STATE_DIR / "vin_decode"
+CARFAX_SUMMARY_DIR = DATA_DIR / "carfax_summaries"
 
 router = APIRouter()
 
@@ -192,6 +209,36 @@ class BankBrainDocsRebuildRequest(BaseModel):
     max_links_per_resource: int = Field(default=12, ge=0, le=80)
 
 
+class XconsoleUserRequest(BaseModel):
+    username: str = Field(..., min_length=2)
+    password: str | None = None
+    display_name: str | None = None
+    role: str = Field(default="operator", pattern="^(admin|manager|operator)$")
+    permissions: list[str] = Field(default_factory=list)
+    active: bool = True
+
+
+class LeadManualAddRequest(BaseModel):
+    customer_name: str = Field(default="Unknown Lead")
+    channel: str = Field(default="facebook")
+    message: str = Field(..., min_length=1)
+    vehicle_vin: str | None = None
+    source: str = Field(default="manual")
+
+
+class LeadRespondRequest(BaseModel):
+    lead_id: str = Field(..., min_length=1)
+    response_text: str = Field(..., min_length=1)
+    channel: str = Field(default="facebook")
+    mark_status: str = Field(default="responded")
+
+
+class OfferUpPostRequest(BaseModel):
+    vin: str = Field(..., min_length=3)
+    caption_override: str | None = None
+    mode: str = Field(default="draft", pattern="^(draft|live)$")
+
+
 def _safe_read_json(path: Path, fallback: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -202,6 +249,10 @@ def _safe_read_json(path: Path, fallback: Any) -> Any:
 def _safe_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _display_path(path: Path) -> str:
@@ -307,6 +358,422 @@ def _parse_listing_file(path: Path) -> dict[str, Any]:
         "detail_url": next((line for line in reversed(lines) if line.startswith("http")), None),
         "file": str(path.relative_to(ROOT_DIR)).replace("\\", "/"),
         "text": text,
+    }
+
+
+def _to_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]+", "", str(value))
+    if cleaned in {"", ".", "-", "-."}:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _public_permission_catalog() -> list[dict[str, str]]:
+    labels = {
+        "inventory.view": "View inventory",
+        "inventory.edit": "Edit inventory",
+        "facebook.post": "Post to Facebook",
+        "facebook.leads": "Read/respond to Facebook leads",
+        "offerup.post": "Create OfferUp drafts",
+        "bankbrain.view": "Use Bank Brain",
+        "bankbrain.train": "Upload RouteOne forms",
+        "users.manage": "Manage users",
+        "admin.full": "Full admin",
+    }
+    return [{"id": item, "label": labels.get(item, item)} for item in DEFAULT_PERMISSIONS]
+
+
+def _lead_id(seed: str) -> str:
+    return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _normalize_lead(raw: Any, index: int = 0) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    message = str(
+        raw.get("message")
+        or raw.get("last_message")
+        or raw.get("body")
+        or raw.get("text")
+        or ""
+    ).strip()
+    customer_name = str(
+        raw.get("customer_name")
+        or raw.get("name")
+        or raw.get("sender_name")
+        or raw.get("from")
+        or "Unknown Lead"
+    ).strip()
+    vehicle_vin = str(raw.get("vehicle_vin") or raw.get("vin") or "").strip().upper()
+    channel = str(raw.get("channel") or raw.get("source") or "facebook").strip().lower()
+    created_at = str(raw.get("created_at") or raw.get("timestamp") or raw.get("created_time") or _utc_now())
+    seed = "|".join([customer_name, vehicle_vin, message, created_at, str(index)])
+    return {
+        "id": str(raw.get("id") or raw.get("lead_id") or _lead_id(seed)),
+        "customer_name": customer_name,
+        "channel": channel,
+        "message": message or "No message captured yet.",
+        "vehicle_vin": vehicle_vin,
+        "source": str(raw.get("source") or channel).strip(),
+        "status": str(raw.get("status") or "new").strip().lower(),
+        "created_at": created_at,
+        "last_message_at": raw.get("last_message_at") or created_at,
+        "conversation_id": raw.get("conversation_id"),
+        "profile_id": raw.get("profile_id"),
+    }
+
+
+def _load_leads() -> list[dict[str, Any]]:
+    payload = _safe_read_json(LEADS_PATH, [])
+    raw_items = payload.get("items", []) if isinstance(payload, dict) else payload
+    if not isinstance(raw_items, list):
+        raw_items = []
+    leads = [lead for lead in (_normalize_lead(item, index) for index, item in enumerate(raw_items)) if lead]
+    response_payload = _safe_read_json(LEAD_RESPONSES_PATH, {"responses": []})
+    responses = response_payload.get("responses", []) if isinstance(response_payload, dict) else []
+    if isinstance(responses, list):
+        responded_ids = {str(item.get("lead_id")) for item in responses if isinstance(item, dict)}
+        for lead in leads:
+            if lead["id"] in responded_ids and lead.get("status") == "new":
+                lead["status"] = "responded"
+    return sorted(leads, key=lambda item: str(item.get("last_message_at") or ""), reverse=True)
+
+
+def _save_leads(leads: list[dict[str, Any]]) -> None:
+    _safe_write_json(
+        LEADS_PATH,
+        {
+            "items": leads,
+            "updated_at": _utc_now(),
+        },
+    )
+
+
+def _append_lead_response(*, lead_id: str, channel: str, response_text: str, author: str | None) -> dict[str, Any]:
+    payload = _safe_read_json(LEAD_RESPONSES_PATH, {"responses": []})
+    responses = payload.get("responses", []) if isinstance(payload, dict) else []
+    if not isinstance(responses, list):
+        responses = []
+    entry = {
+        "id": _lead_id(f"{lead_id}|{response_text}|{time.time()}"),
+        "lead_id": lead_id,
+        "channel": channel,
+        "response_text": response_text,
+        "author": author or "xconsole",
+        "created_at": _utc_now(),
+        "delivery_status": "logged",
+    }
+    responses.append(entry)
+    _safe_write_json(LEAD_RESPONSES_PATH, {"responses": responses[-1000:], "updated_at": _utc_now()})
+    return entry
+
+
+def _facebook_lead_connection_status() -> dict[str, Any]:
+    token = str(os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "")).strip()
+    page_id = str(os.getenv("FACEBOOK_PAGE_ID", "")).strip()
+    app_id = str(os.getenv("FACEBOOK_APP_ID", "")).strip()
+    missing = []
+    if not token:
+        missing.append("FACEBOOK_PAGE_ACCESS_TOKEN")
+    if not page_id:
+        missing.append("FACEBOOK_PAGE_ID")
+    return {
+        "configured": not missing,
+        "missing": missing,
+        "page_id_configured": bool(page_id),
+        "token_configured": bool(token),
+        "app_id_configured": bool(app_id),
+    }
+
+
+def _sync_facebook_leads() -> dict[str, Any]:
+    connection = _facebook_lead_connection_status()
+    if not connection.get("configured"):
+        return {
+            "ok": False,
+            "mode": "not_connected",
+            "connection": connection,
+            "imported": 0,
+            "guidance": [
+                "Set FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN on Railway to enable Graph lead pull.",
+                "Until connected, use Manual Lead to keep Messenger conversations visible in Xconsole.",
+            ],
+        }
+
+    # Marketplace lead message APIs vary by account/page permissions. Keep the
+    # endpoint safe: verify token connectivity and expose the next missing scope
+    # instead of deleting or mutating live conversations.
+    page_id = str(os.getenv("FACEBOOK_PAGE_ID", "")).strip()
+    token = str(os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "")).strip()
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                f"https://graph.facebook.com/v19.0/{page_id}",
+                params={"fields": "id,name", "access_token": token},
+            )
+        payload = response.json()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "mode": "connection_error",
+            "connection": connection,
+            "error": str(exc),
+            "imported": 0,
+        }
+
+    if response.status_code >= 400:
+        return {
+            "ok": False,
+            "mode": "graph_rejected",
+            "connection": connection,
+            "graph_status": response.status_code,
+            "graph_response": payload,
+            "imported": 0,
+        }
+
+    return {
+        "ok": True,
+        "mode": "token_verified",
+        "connection": connection,
+        "page": payload,
+        "imported": 0,
+        "guidance": [
+            "Page token is valid. Add Facebook lead/conversation permissions to import Messenger threads automatically.",
+        ],
+    }
+
+
+def _load_offerup_status() -> dict[str, Any]:
+    payload = _safe_read_json(OFFERUP_STATUS_PATH, {"posts": {}})
+    posts = payload.get("posts", {}) if isinstance(payload, dict) else {}
+    if not isinstance(posts, dict):
+        posts = {}
+    return {
+        "ok": True,
+        "ready_for_live": False,
+        "mode": "draft",
+        "reason": "OfferUp has no connected live API/session in this build; Xconsole creates one-click drafts.",
+        "posts": posts,
+        "drafts_count": len(posts),
+        "updated_at": payload.get("updated_at") if isinstance(payload, dict) else None,
+    }
+
+
+def _save_offerup_post(vin: str, post: dict[str, Any]) -> None:
+    status = _load_offerup_status()
+    posts = status.get("posts", {})
+    if not isinstance(posts, dict):
+        posts = {}
+    posts[vin] = post
+    _safe_write_json(OFFERUP_STATUS_PATH, {"posts": posts, "updated_at": _utc_now()})
+
+
+def _offerup_post_from_inventory(request: OfferUpPostRequest) -> dict[str, Any]:
+    clean_vin = str(request.vin or "").strip().upper()
+    vehicle = _find_vehicle_by_vin(clean_vin)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail={"message": f"Vehicle not found for VIN {clean_vin}"})
+    caption = _build_caption_from_vehicle(vehicle, caption_override=request.caption_override)
+    OFFERUP_POSTS_DIR.mkdir(parents=True, exist_ok=True)
+    target = OFFERUP_POSTS_DIR / f"{clean_vin}_{int(time.time())}.txt"
+    target.write_text(caption, encoding="utf-8")
+    post = {
+        "vin": clean_vin,
+        "mode": request.mode,
+        "status": "drafted" if request.mode == "draft" else "live_not_connected",
+        "draft_file": _display_path(target),
+        "caption": caption,
+        "created_at": _utc_now(),
+    }
+    _save_offerup_post(clean_vin, post)
+    _append_audit_event("offerup_post", {"vin": clean_vin, "mode": request.mode, "status": post["status"]})
+    return {
+        "ok": request.mode == "draft",
+        "vin": clean_vin,
+        "post": post,
+        "live_success": False,
+        "live_detail": "OfferUp live posting is not connected. Draft was created for operator review.",
+        "status": _load_offerup_status(),
+    }
+
+
+def _vin_decode_cache_path(vin: str) -> Path:
+    clean_vin = re.sub(r"[^A-Z0-9]", "", str(vin or "").upper()) or "UNKNOWN"
+    VIN_DECODE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return VIN_DECODE_CACHE_DIR / f"{clean_vin}.json"
+
+
+def _decode_vin_values(vin: str) -> dict[str, Any]:
+    clean_vin = re.sub(r"[^A-Z0-9]", "", str(vin or "").upper())
+    if len(clean_vin) < 11:
+        raise HTTPException(status_code=400, detail={"message": "VIN must be at least 11 characters"})
+    cache_path = _vin_decode_cache_path(clean_vin)
+    cached = _safe_read_json(cache_path, None)
+    if isinstance(cached, dict) and cached.get("vin") == clean_vin:
+        return cached
+
+    decoded: dict[str, Any] = {
+        "vin": clean_vin,
+        "ok": False,
+        "source": "fallback",
+        "decoded_at": _utc_now(),
+        "fields": {},
+        "raw": None,
+    }
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+            response = client.get(
+                f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValuesExtended/{clean_vin}",
+                params={"format": "json"},
+            )
+        payload = response.json()
+        result = (payload.get("Results") or [{}])[0] if isinstance(payload, dict) else {}
+        if isinstance(result, dict):
+            fields = {
+                "year": result.get("ModelYear"),
+                "make": result.get("Make"),
+                "model": result.get("Model"),
+                "trim": result.get("Trim") or result.get("Series"),
+                "body_class": result.get("BodyClass"),
+                "vehicle_type": result.get("VehicleType"),
+                "drive_type": result.get("DriveType"),
+                "engine": " ".join(
+                    str(part)
+                    for part in [
+                        result.get("EngineCylinders") and f"{result.get('EngineCylinders')} cyl",
+                        result.get("DisplacementL") and f"{result.get('DisplacementL')}L",
+                        result.get("FuelTypePrimary"),
+                    ]
+                    if part
+                ),
+                "manufacturer": result.get("Manufacturer"),
+                "plant_country": result.get("PlantCountry"),
+                "gvwr": result.get("GVWR"),
+            }
+            decoded.update({"ok": True, "source": "nhtsa_vpic", "fields": fields, "raw": result})
+    except Exception as exc:
+        decoded["error"] = str(exc)
+
+    if not decoded.get("ok"):
+        vehicle = _find_vehicle_by_vin(clean_vin)
+        title = str(vehicle.get("title") or "") if vehicle else ""
+        parts = title.split()
+        decoded["fields"] = {
+            "year": next((part for part in parts if re.fullmatch(r"20[0-9]{2}|19[0-9]{2}", part)), None),
+            "make": parts[1] if len(parts) > 1 else None,
+            "model": parts[2] if len(parts) > 2 else None,
+            "trim": " ".join(parts[3:]) if len(parts) > 3 else None,
+        }
+    _safe_write_json(cache_path, decoded)
+    return decoded
+
+
+def _carfax_summary_for_vin(vin: str) -> dict[str, Any] | None:
+    clean_vin = str(vin or "").strip().upper()
+    if not clean_vin:
+        return None
+    candidates = [CARFAX_SUMMARY_DIR / f"{clean_vin}.json", CARFAX_SUMMARY_DIR / f"{clean_vin.lower()}.json"]
+    for path in candidates:
+        payload = _safe_read_json(path, None)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _vehicle_bank_brain(vin: str) -> dict[str, Any]:
+    clean_vin = str(vin or "").strip().upper()
+    vehicle = _find_vehicle_by_vin(clean_vin)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail={"message": f"Vehicle not found for VIN {clean_vin}"})
+    decoded = _decode_vin_values(clean_vin)
+    fields = decoded.get("fields") if isinstance(decoded, dict) else {}
+    if not isinstance(fields, dict):
+        fields = {}
+    price = _to_float(vehicle.get("price")) or 0.0
+    mileage = _to_float(vehicle.get("mileage")) or 0.0
+    year = _to_float(fields.get("year"))
+    current_year = datetime.now(timezone.utc).year
+    age = max(0, current_year - int(year)) if year else None
+    down = max(1000.0, round(price * 0.08, 2)) if price else 0.0
+
+    structure_request = CreditStructureRequest(
+        vin=clean_vin,
+        vehicle_price=price,
+        taxes=round(price * 0.07, 2),
+        fees=1199,
+        backend_products=2500,
+        down_payment=down,
+        term_months=72,
+        apr=11.99,
+        monthly_income=None,
+        current_dti=None,
+        credit_score=None,
+        tradelines=None,
+        derogatories=None,
+        utilization=None,
+    )
+    structure_result = _simulate_credit_structure(structure_request)
+    recommendation = dict(structure_result.get("recommendation") or {})
+    ranked = list(recommendation.get("ranked_banks") or [])
+
+    collateral_flags: list[str] = []
+    adjustment = 0.0
+    if age is not None and age >= 8:
+        collateral_flags.append("Older collateral: some prime banks may cap term/LTV.")
+        adjustment -= 7.0
+    if mileage >= 100_000:
+        collateral_flags.append("High-mileage collateral: expect stricter advance and term caps.")
+        adjustment -= 8.0
+    if price >= 75_000:
+        collateral_flags.append("High-ticket unit: down payment and bureau strength matter more.")
+        adjustment -= 3.0
+
+    adjusted_ranked: list[dict[str, Any]] = []
+    for item in ranked:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        base_confidence = _to_float(row.get("confidence")) or 0.0
+        row["confidence"] = max(1.0, min(99.0, round(base_confidence + adjustment, 1)))
+        row.setdefault("reasons", [])
+        if collateral_flags:
+            row["reasons"] = list(row.get("reasons") or []) + collateral_flags[:1]
+        adjusted_ranked.append(row)
+    adjusted_ranked.sort(key=lambda item: item.get("confidence", 0), reverse=True)
+    if adjusted_ranked:
+        recommendation["ranked_banks"] = adjusted_ranked
+        recommendation["best_bank"] = adjusted_ranked[0]
+        recommendation["backup_bank"] = adjusted_ranked[1] if len(adjusted_ranked) > 1 else None
+    recommendation["collateral_flags"] = collateral_flags
+
+    carfax_summary = _carfax_summary_for_vin(clean_vin)
+    packet = [
+        "Pull/attach credit app before final lender selection.",
+        "Attach bookout, invoice/sticker if available, proof of income, proof of residence, insurance, and trade payoff if applicable.",
+    ]
+    if collateral_flags:
+        packet.append("Pre-empt collateral concerns with stronger down payment or shorter term.")
+
+    return {
+        "ok": True,
+        "vin": clean_vin,
+        "vehicle": vehicle,
+        "decode": decoded,
+        "carfax_summary": carfax_summary,
+        "default_structure": structure_result.get("structure"),
+        "recommendation": recommendation,
+        "packet_guidance": packet,
+        "assumptions": [
+            "No customer bureau attached yet, so confidence is collateral/deal-structure based.",
+            "Final approval probability should be recalculated after credit report upload.",
+        ],
     }
 
 
@@ -3516,6 +3983,181 @@ def _eligible_for_posting(vehicle: dict[str, Any]) -> bool:
     status = str(vehicle.get("status_label") or vehicle.get("status") or "").strip().lower()
     photos = vehicle.get("photos") or vehicle.get("images") or []
     return status == "ready" and bool(photos)
+
+
+def _require_permission(request: Request, permission: str) -> dict[str, Any]:
+    user = current_user_from_auth_header(request.headers.get("authorization", ""))
+    if not user:
+        raise HTTPException(status_code=401, detail={"message": "Authentication required"})
+    permissions = set(user.get("permissions") or [])
+    if "admin.full" in permissions or permission in permissions:
+        return user
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "message": f"Missing permission: {permission}",
+            "user": user.get("username"),
+        },
+    )
+
+
+@router.get("/me")
+def me(request: Request) -> dict[str, Any]:
+    user = current_user_from_auth_header(request.headers.get("authorization", ""))
+    return {
+        "ok": bool(user),
+        "user": user,
+        "permissions": _public_permission_catalog(),
+    }
+
+
+@router.get("/admin/users")
+def admin_users(request: Request) -> dict[str, Any]:
+    _require_permission(request, "users.manage")
+    return {
+        "ok": True,
+        "items": list_public_users(),
+        "permissions": _public_permission_catalog(),
+    }
+
+
+@router.post("/admin/users")
+def admin_users_create(request: Request, payload: XconsoleUserRequest) -> dict[str, Any]:
+    _require_permission(request, "users.manage")
+    try:
+        user = upsert_user(
+            username=payload.username,
+            password=payload.password,
+            display_name=payload.display_name,
+            role=payload.role,
+            permissions=payload.permissions,
+            active=payload.active,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+    return {"ok": True, "user": user, "items": list_public_users()}
+
+
+@router.put("/admin/users/{username}")
+def admin_users_update(username: str, request: Request, payload: XconsoleUserRequest) -> dict[str, Any]:
+    _require_permission(request, "users.manage")
+    try:
+        user = upsert_user(
+            username=username,
+            password=payload.password,
+            display_name=payload.display_name,
+            role=payload.role,
+            permissions=payload.permissions,
+            active=payload.active,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
+    return {"ok": True, "user": user, "items": list_public_users()}
+
+
+@router.delete("/admin/users/{username}")
+def admin_users_delete(username: str, request: Request) -> dict[str, Any]:
+    _require_permission(request, "users.manage")
+    try:
+        user = deactivate_user(username)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail={"message": str(exc)}) from exc
+    return {"ok": True, "user": user, "items": list_public_users()}
+
+
+@router.get("/leads/inbox")
+def leads_inbox(request: Request) -> dict[str, Any]:
+    _require_permission(request, "facebook.leads")
+    leads = _load_leads()
+    connection = _facebook_lead_connection_status()
+    return {
+        "ok": True,
+        "items": leads,
+        "count": len(leads),
+        "new_count": len([item for item in leads if item.get("status") == "new"]),
+        "responded_count": len([item for item in leads if item.get("status") == "responded"]),
+        "facebook_connection": connection,
+    }
+
+
+@router.post("/leads/manual-add")
+def leads_manual_add(request: Request, payload: LeadManualAddRequest) -> dict[str, Any]:
+    user = _require_permission(request, "facebook.leads")
+    leads = _load_leads()
+    entry = {
+        "id": _lead_id(f"{payload.customer_name}|{payload.message}|{time.time()}"),
+        "customer_name": payload.customer_name.strip() or "Unknown Lead",
+        "channel": payload.channel.strip().lower() or "facebook",
+        "message": payload.message.strip(),
+        "vehicle_vin": str(payload.vehicle_vin or "").strip().upper(),
+        "source": payload.source.strip() or "manual",
+        "status": "new",
+        "created_at": _utc_now(),
+        "last_message_at": _utc_now(),
+        "created_by": user.get("username"),
+    }
+    leads.insert(0, entry)
+    _save_leads(leads)
+    return {"ok": True, "lead": entry, "items": _load_leads()}
+
+
+@router.post("/leads/respond")
+def leads_respond(request: Request, payload: LeadRespondRequest) -> dict[str, Any]:
+    user = _require_permission(request, "facebook.leads")
+    leads = _load_leads()
+    target = next((item for item in leads if str(item.get("id")) == payload.lead_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail={"message": "Lead not found"})
+    response = _append_lead_response(
+        lead_id=payload.lead_id,
+        channel=payload.channel,
+        response_text=payload.response_text.strip(),
+        author=str(user.get("username") or "xconsole"),
+    )
+    for item in leads:
+        if str(item.get("id")) == payload.lead_id:
+            item["status"] = payload.mark_status or "responded"
+            item["last_response_at"] = response["created_at"]
+    _save_leads(leads)
+    return {
+        "ok": True,
+        "lead_id": payload.lead_id,
+        "response": response,
+        "delivery_note": "Response is logged in Xconsole. Add Facebook Page token/scopes for live Messenger send.",
+        "items": _load_leads(),
+    }
+
+
+@router.post("/leads/sync-facebook")
+def leads_sync_facebook(request: Request) -> dict[str, Any]:
+    _require_permission(request, "facebook.leads")
+    result = _sync_facebook_leads()
+    result["items"] = _load_leads()
+    return result
+
+
+@router.get("/offerup/status")
+def offerup_status(request: Request) -> dict[str, Any]:
+    _require_permission(request, "offerup.post")
+    return _load_offerup_status()
+
+
+@router.post("/offerup/post/from-inventory")
+def offerup_post_from_inventory(request: Request, payload: OfferUpPostRequest) -> dict[str, Any]:
+    _require_permission(request, "offerup.post")
+    return _offerup_post_from_inventory(payload)
+
+
+@router.get("/vehicles/{vin}/decode")
+def vehicles_decode(vin: str, request: Request) -> dict[str, Any]:
+    _require_permission(request, "inventory.view")
+    return _decode_vin_values(vin)
+
+
+@router.get("/bank-brain/vehicle/{vin}")
+def bank_brain_vehicle(vin: str, request: Request) -> dict[str, Any]:
+    _require_permission(request, "bankbrain.view")
+    return _vehicle_bank_brain(vin)
 
 
 @router.get("/health")
