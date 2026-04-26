@@ -53,6 +53,7 @@ INVENTORY_LIVE_CACHE_PATH = DATA_DIR / "latest" / "inventory_dealership_live.jso
 INVENTORY_LIVE_META_PATH = DATA_DIR / "latest" / "inventory_dealership_live_meta.json"
 INVENTORY_MANUAL_PATH = DATA_DIR / "latest" / "inventory_manual.json"
 DEFAULT_DEALERSHIP_INVENTORY_URL = "https://www.tavernachryslerdodgejeepramfiat.com/used-inventory/index.htm"
+DEFAULT_DEALERSHIP_NEW_INVENTORY_URL = "https://www.tavernachryslerdodgejeepramfiat.com/new-inventory/index.htm"
 FACEBOOK_POST_STATUS_PATH = RUNTIME_DIR / "facebook_post_status.json"
 VEHICLE_ASSETS_CACHE_DIR = RUNTIME_DIR / "vehicle_assets"
 BANK_BRAIN_HISTORY_PATH = RUNTIME_DIR / "bank_brain_history.json"
@@ -269,8 +270,35 @@ def _sanitize_doc_segment(value: str, fallback: str) -> str:
 
 
 def _default_inventory_source_url() -> str:
-    raw = str(os.getenv("DEALERSHIP_INVENTORY_URL", DEFAULT_DEALERSHIP_INVENTORY_URL)).strip()
-    return raw or DEFAULT_DEALERSHIP_INVENTORY_URL
+    return ", ".join(_default_inventory_source_urls())
+
+
+def _split_inventory_source_urls(raw: str | None) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    candidates = re.split(r"[\r\n,]+", text)
+    urls = []
+    seen = set()
+    for candidate in candidates:
+        url = candidate.strip()
+        if not url or not re.match(r"^https?://", url, flags=re.IGNORECASE):
+            continue
+        lowered = url.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        urls.append(url)
+    return urls
+
+
+def _default_inventory_source_urls() -> list[str]:
+    multi = _split_inventory_source_urls(os.getenv("DEALERSHIP_INVENTORY_URLS"))
+    if multi:
+        return multi
+    used = str(os.getenv("DEALERSHIP_INVENTORY_URL", DEFAULT_DEALERSHIP_INVENTORY_URL)).strip()
+    new = str(os.getenv("DEALERSHIP_NEW_INVENTORY_URL", DEFAULT_DEALERSHIP_NEW_INVENTORY_URL)).strip()
+    return _split_inventory_source_urls(", ".join([used, new])) or [DEFAULT_DEALERSHIP_INVENTORY_URL]
 
 
 def _to_price_text(value: str | int | float) -> str:
@@ -1723,41 +1751,67 @@ def _sync_live_inventory(
     timeout_seconds: int,
     persist: bool,
 ) -> dict[str, Any]:
-    target_source = str(source_url or "").strip() or _default_inventory_source_url()
+    target_sources = _split_inventory_source_urls(source_url) or _default_inventory_source_urls()
+    fetched_payloads: list[dict[str, Any]] = []
+    diagnostics: list[str] = []
+    errors: list[dict[str, Any]] = []
 
-    try:
-        fetched = _fetch_live_inventory_records(
-            source_url=target_source,
-            timeout_seconds=timeout_seconds,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
+    for target_source in target_sources:
+        try:
+            fetched = _fetch_live_inventory_records(
+                source_url=target_source,
+                timeout_seconds=timeout_seconds,
+            )
+            fetched_payloads.append(fetched)
+            diagnostics.extend([f"{target_source}: {item}" for item in list(fetched.get("diagnostics") or [])])
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            errors.append({"source_url": target_source, "detail": detail})
+            diagnostics.append(f"{target_source}: error={detail}")
+        except Exception as exc:
+            errors.append({"source_url": target_source, "error": str(exc)})
+            diagnostics.append(f"{target_source}: error={exc}")
+
+    if not fetched_payloads:
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Failed to fetch dealership inventory source",
-                "source_url": target_source,
-                "error": str(exc),
+                "message": "Failed to fetch every dealership inventory source",
+                "source_urls": target_sources,
+                "errors": errors,
             },
-        ) from exc
+        )
 
-    if persist and fetched.get("items"):
+    merged_items = _merge_inventory_sources(
+        [
+            item
+            for fetched in fetched_payloads
+            for item in list(fetched.get("items") or [])
+            if isinstance(item, dict)
+        ],
+        [],
+    )
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    joined_source = ", ".join(target_sources)
+
+    if persist and merged_items:
         _persist_inventory_live_cache(
-            source_url=target_source,
-            fetched_at=str(fetched.get("fetched_at")),
-            items=list(fetched.get("items") or []),
-            diagnostics=list(fetched.get("diagnostics") or []),
+            source_url=joined_source,
+            fetched_at=fetched_at,
+            items=merged_items,
+            diagnostics=diagnostics,
         )
 
     return {
-        "ok": bool(fetched.get("items")),
-        "source_url": target_source,
-        "fetched_at": fetched.get("fetched_at"),
-        "items_count": fetched.get("items_count", 0),
-        "items": fetched.get("items", []),
-        "persisted": bool(persist and fetched.get("items")),
-        "diagnostics": fetched.get("diagnostics", []),
+        "ok": bool(merged_items),
+        "source_url": joined_source,
+        "source_urls": target_sources,
+        "fetched_at": fetched_at,
+        "items_count": len(merged_items),
+        "items": merged_items,
+        "persisted": bool(persist and merged_items),
+        "diagnostics": diagnostics,
+        "errors": errors,
         "source_status": _inventory_source_status(),
     }
 
