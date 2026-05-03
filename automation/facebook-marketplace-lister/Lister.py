@@ -1863,6 +1863,25 @@ class Lister:
     def _required_publish_checkboxes(self):
         return getattr(self, "_pending_publish_checkboxes", []) or []
 
+    def _element_is_interactive_enabled(self, element):
+        if not element:
+            return False
+        try:
+            if not element.is_displayed() or not element.is_enabled():
+                return False
+            aria_disabled = str(element.get_attribute("aria-disabled") or "").strip().lower()
+            disabled_attr = str(element.get_attribute("disabled") or "").strip().lower()
+            classes = str(element.get_attribute("class") or "").strip().lower()
+            if aria_disabled == "true":
+                return False
+            if disabled_attr not in {"", "false", "none"}:
+                return False
+            if "disabled" in classes and "not-disabled" not in classes:
+                return False
+            return True
+        except Exception:
+            return False
+
     def _assert_ready_to_publish(self):
         body_text = self._body_text()
         lowered_body = body_text.lower()
@@ -1927,6 +1946,7 @@ class Lister:
             log("Clicking Next", "main")
             self._click_element(next_button)
             time.sleep(max(self.field_wait_seconds, 1.0))
+            self._assert_ready_to_publish()
 
         publish_button = self._find_button_by_text(["publish"]) or self._find_button_by_text(publish_labels) or self._find_clickable_candidate(publish_labels)
         if not publish_button:
@@ -1937,6 +1957,19 @@ class Lister:
                         "current_url": self.driver.current_url,
                         "title": self.driver.title,
                         "inputs": self._summarize_inputs(),
+                    }
+                )
+            )
+        if not self._element_is_interactive_enabled(publish_button):
+            raise RuntimeError(
+                json.dumps(
+                    {
+                        "message": "facebook publish button is present but not enabled",
+                        "current_url": self.driver.current_url,
+                        "title": self.driver.title,
+                        "inputs": self._summarize_inputs(),
+                        "buttons": self._summarize_buttons(),
+                        "body_preview": self._body_text()[:1600],
                     }
                 )
             )

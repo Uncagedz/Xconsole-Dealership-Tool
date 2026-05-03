@@ -8409,6 +8409,8 @@ def _friendly_facebook_publish_detail(*, output: str = "", error_text: str = "",
 
 def _write_facebook_live_status(status_file: Path, payload: dict[str, Any]) -> None:
     stage = _friendly_facebook_publish_detail(fallback=str(payload.get("stage") or "")) if payload.get("type") == "failure" else str(payload.get("stage") or "")
+    if stage.lower().startswith("facebook session archived:"):
+        stage = "Facebook session refreshed."
     clean_payload = dict(payload)
     clean_payload["stage"] = stage[:420] + ("..." if len(stage) > 420 else "")
     clean_payload["updated_at"] = datetime.now(timezone.utc).isoformat()

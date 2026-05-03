@@ -243,11 +243,6 @@ def main() -> int:
                     pass
                 try:
                     archived = archive_runtime_session(root)
-                    if archived.get("ok"):
-                        print(
-                            f"facebook session archived: {archived.get('destination')}",
-                            file=sys.stderr,
-                        )
                 except Exception:
                     pass
         os.chdir(original_cwd)
