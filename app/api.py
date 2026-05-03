@@ -8260,16 +8260,7 @@ def _publish_live(payload: FacebookPostRequest) -> tuple[bool, str, dict[str, An
             {"ok": False, "vin": payload.vin, "title": payload.title, "stage": detail, "type": "failure"},
         )
         return False, detail, {"marketplace_status": "needs_review", "error": detail}
-    parsed_result = None
-    for line in reversed(output.splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            parsed_result = json.loads(line)
-            break
-        except Exception:
-            continue
+    parsed_result = _last_json_object_from_output(output)
     if not isinstance(parsed_result, dict):
         detail = _friendly_facebook_publish_detail(
             output=output,
@@ -8338,6 +8329,7 @@ def _strip_facebook_automation_noise(text: str) -> str:
 
 def _last_json_object_from_output(text: str) -> dict[str, Any] | None:
     clean = _strip_facebook_automation_noise(text)
+    parsed_candidates: list[dict[str, Any]] = []
     for line in reversed(clean.splitlines()):
         line = line.strip()
         if not line.startswith("{"):
@@ -8347,8 +8339,30 @@ def _last_json_object_from_output(text: str) -> dict[str, Any] | None:
         except Exception:
             continue
         if isinstance(parsed, dict):
-            return parsed
-    return None
+            parsed_candidates.append(parsed)
+    if not parsed_candidates:
+        return None
+
+    def score(payload: dict[str, Any]) -> tuple[int, int]:
+        rich_keys = {
+            "confirmation",
+            "marketplace_status",
+            "listing_url",
+            "posted",
+            "submitted",
+            "results",
+            "failed",
+            "live_success",
+            "live_detail",
+            "error",
+            "message",
+        }
+        richness = sum(1 for key in rich_keys if key in payload)
+        session_noise = 1 if {"session_archived", "debug"} & set(payload.keys()) else 0
+        return (session_noise, -richness)
+
+    parsed_candidates.sort(key=score)
+    return parsed_candidates[0]
 
 
 def _friendly_facebook_publish_detail(*, output: str = "", error_text: str = "", fallback: str = "") -> str:
