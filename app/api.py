@@ -8171,7 +8171,7 @@ def _publish_live(payload: FacebookPostRequest) -> tuple[bool, str, dict[str, An
     os.environ["FACEBOOK_FIELD_WAIT_SECONDS"] = "0.22"
     os.environ["FACEBOOK_ACCOUNT_CHOOSER_WAIT_SECONDS"] = "0.45"
     os.environ["FACEBOOK_POST_NAV_WAIT_SECONDS"] = "1.1"
-    os.environ["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "30"
+    os.environ["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "60"
     requirement_errors = _validate_live_requirements(
         account_id=account_id,
         images=payload.images,
@@ -8218,7 +8218,7 @@ def _publish_live(payload: FacebookPostRequest) -> tuple[bool, str, dict[str, An
     publish_env["FACEBOOK_FIELD_WAIT_SECONDS"] = "0.22"
     publish_env["FACEBOOK_ACCOUNT_CHOOSER_WAIT_SECONDS"] = "0.45"
     publish_env["FACEBOOK_POST_NAV_WAIT_SECONDS"] = "1.1"
-    publish_env["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "30"
+    publish_env["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "60"
     publish_env["FACEBOOK_PUBLISH_STATUS_FILE"] = str(status_file)
     publish_env["FACEBOOK_PUBLISH_VIN"] = str(payload.vin or "")
     publish_env["FACEBOOK_PUBLISH_TITLE"] = str(payload.title or "")
@@ -8230,7 +8230,7 @@ def _publish_live(payload: FacebookPostRequest) -> tuple[bool, str, dict[str, An
             capture_output=True,
             text=True,
             check=False,
-    timeout=int(os.getenv("FACEBOOK_PUBLISH_TIMEOUT_SECONDS", "75") or "75"),
+    timeout=int(os.getenv("FACEBOOK_PUBLISH_TIMEOUT_SECONDS", "180") or "180"),
         )
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
@@ -8432,7 +8432,7 @@ def _publish_live_batch(payloads: list[FacebookPostRequest], account_id: str) ->
     os.environ["FACEBOOK_FIELD_WAIT_SECONDS"] = "0.22"
     os.environ["FACEBOOK_ACCOUNT_CHOOSER_WAIT_SECONDS"] = "0.45"
     os.environ["FACEBOOK_POST_NAV_WAIT_SECONDS"] = "1.1"
-    os.environ["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "30"
+    os.environ["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "60"
     publish_items: list[dict[str, Any]] = []
     for payload in payloads:
         requirement_errors = _validate_live_requirements(account_id=account_id, images=payload.images)
@@ -8474,7 +8474,7 @@ def _publish_live_batch(payloads: list[FacebookPostRequest], account_id: str) ->
     publish_env["FACEBOOK_FIELD_WAIT_SECONDS"] = "0.22"
     publish_env["FACEBOOK_ACCOUNT_CHOOSER_WAIT_SECONDS"] = "0.45"
     publish_env["FACEBOOK_POST_NAV_WAIT_SECONDS"] = "1.1"
-    publish_env["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "30"
+    publish_env["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "60"
     publish_env["FACEBOOK_PUBLISH_STATUS_FILE"] = str(status_file)
     try:
         completed = subprocess.run(

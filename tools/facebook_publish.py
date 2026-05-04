@@ -206,7 +206,7 @@ def main() -> int:
         os.environ["FACEBOOK_FIELD_WAIT_SECONDS"] = "0.22"
         os.environ["FACEBOOK_ACCOUNT_CHOOSER_WAIT_SECONDS"] = "0.45"
         os.environ["FACEBOOK_POST_NAV_WAIT_SECONDS"] = "1.1"
-        os.environ["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "30"
+        os.environ["FACEBOOK_PUBLISH_CONFIRM_SECONDS"] = "60"
         if _env_flag("FACEBOOK_REQUIRE_SAVED_SESSION_DEFAULT", False) and require_saved_session:
             os.environ["FACEBOOK_REQUIRE_SAVED_SESSION"] = "1"
         os.chdir(lister_dir)
