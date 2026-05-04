@@ -1368,7 +1368,7 @@ export function TavernaCommandCenter() {
         : `${batchPrefix}${titleCaseStatus(postState)} for ${clean}: ${readableFacebookStatus(payload.post_result?.live_detail || 'Marketplace listing was not confirmed live.')}`,
     );
     if (options.refreshAfter !== false) {
-      await refresh();
+      void refresh().catch(() => undefined);
     }
     return payload;
   }
@@ -1439,7 +1439,7 @@ export function TavernaCommandCenter() {
       setBatchProgress({ current: queue.length, total: queue.length, success, failed });
       setStatusText(payload.live_detail || `Facebook batch finished: ${success} posted, ${failed} failed.`);
       setBatchSelectedVins({});
-      await refresh();
+      void refresh().catch(() => undefined);
     } catch (error: unknown) {
       setStatusText(`Facebook batch failed: ${readableFacebookStatus(error)}`);
     } finally {
