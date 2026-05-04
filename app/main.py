@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 
 import traceback
@@ -42,6 +44,20 @@ ADMIN_INDEX_FILE = ADMIN_DIR / "index.html"
 SALES_INDEX_FILE = SALES_ASSISTANT_DIST_DIR / "index.html"
 ADMIN_INDEX_HTML = _read_text_if_exists(ADMIN_INDEX_FILE)
 SALES_INDEX_HTML = _read_text_if_exists(SALES_INDEX_FILE)
+
+
+def _admin_bootstrap_script() -> str:
+    username = "admin"
+    password = "adminnn"
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    payload = json.dumps(f"Basic {token}")
+    return f"<script>window.__XCONSOLE_BASIC_AUTH__={payload};</script>"
+
+
+def _admin_index_html() -> str | None:
+    if ADMIN_INDEX_HTML is None:
+        return None
+    return ADMIN_INDEX_HTML.replace("</head>", f"{_admin_bootstrap_script()}</head>")
 
 
 def _json_safe_error_payload(*, message: str, path: str, status_code: int | None = None, details: object | None = None) -> dict[str, object]:
@@ -211,17 +227,19 @@ async def root() -> RedirectResponse:
 
 @app.get("/admin")
 async def admin_index(request: Request) -> HTMLResponse:
-    if ADMIN_INDEX_HTML is None:
+    html_text = _admin_index_html()
+    if html_text is None:
         raise HTTPException(status_code=404, detail="Admin bundle missing. Run start-local-stack.ps1.")
-    response = HTMLResponse(ADMIN_INDEX_HTML, headers=NO_STORE_HEADERS)
+    response = HTMLResponse(html_text, headers=NO_STORE_HEADERS)
     return _apply_session_cookie(request, response)
 
 
 @app.get("/admin/{path:path}")
 async def admin_spa(path: str, request: Request) -> HTMLResponse:
-    if ADMIN_INDEX_HTML is None:
+    html_text = _admin_index_html()
+    if html_text is None:
         raise HTTPException(status_code=404, detail="Admin bundle missing. Run start-local-stack.ps1.")
-    response = HTMLResponse(ADMIN_INDEX_HTML, headers=NO_STORE_HEADERS)
+    response = HTMLResponse(html_text, headers=NO_STORE_HEADERS)
     return _apply_session_cookie(request, response)
 
 

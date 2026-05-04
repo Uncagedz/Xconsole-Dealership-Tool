@@ -2,6 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSalesContext } from './context';
 import './TavernaCommandCenter.css';
 
+declare global {
+  interface Window {
+    __XCONSOLE_BASIC_AUTH__?: string;
+  }
+}
+
 type Vehicle = {
   vin: string;
   title?: string;
@@ -751,7 +757,12 @@ function apiUrl(url: string): string {
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const target = apiUrl(url);
-  const response = await fetch(target, { credentials: 'same-origin', ...init });
+  const headers = new Headers(init?.headers || {});
+  const authHeader = String(window.__XCONSOLE_BASIC_AUTH__ || '').trim();
+  if (authHeader && !headers.has('Authorization')) {
+    headers.set('Authorization', authHeader);
+  }
+  const response = await fetch(target, { credentials: 'same-origin', ...init, headers });
   const contentType = String(response.headers.get('content-type') || '').toLowerCase();
   const rawText = (await response.text().catch(() => '')).trim();
   const isJsonLike = contentType.includes('application/json') || contentType.includes('application/problem+json') || rawText.startsWith('{') || rawText.startsWith('[');
