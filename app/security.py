@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import hashlib
 import json
 import os
@@ -292,3 +293,36 @@ def authenticate_basic_header(auth_header: str | None) -> dict[str, Any] | None:
 
 def current_user_from_auth_header(auth_header: str | None) -> dict[str, Any] | None:
     return authenticate_basic_header(auth_header)
+
+
+def _session_cookie_secret() -> str:
+    explicit = str(os.getenv("XCONSOLE_SESSION_SECRET", "")).strip()
+    if explicit:
+        return explicit
+    admin_user = str(os.getenv("XCONSOLE_BASIC_AUTH_USER", "admin")).strip() or "admin"
+    admin_pass = str(os.getenv("XCONSOLE_BASIC_AUTH_PASSWORD", "adminnn")).strip() or "adminnn"
+    return f"xconsole-session::{admin_user}::{admin_pass}"
+
+
+def issue_session_cookie(username: str) -> str:
+    clean_username = str(username or "").strip().lower()
+    signature = hmac.new(
+        _session_cookie_secret().encode("utf-8"),
+        clean_username.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{clean_username}:{signature}"
+
+
+def current_user_from_session_cookie(cookie_value: str | None) -> dict[str, Any] | None:
+    raw = str(cookie_value or "").strip()
+    username, sep, signature = raw.partition(":")
+    if not username or not sep or not signature:
+        return None
+    expected = issue_session_cookie(username).partition(":")[2]
+    if not hmac.compare_digest(signature, expected):
+        return None
+    for record in load_user_records():
+        if str(record.get("username", "")).lower() == username.lower() and bool(record.get("active", True)):
+            return _public_user(record)
+    return None

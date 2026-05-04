@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .api import router as api_router
-from .security import authenticate_basic_header
+from .security import authenticate_basic_header, current_user_from_session_cookie, issue_session_cookie
 
 APP_DIR = Path(__file__).resolve().parent
 ROOT_DIR = APP_DIR.parent
@@ -137,8 +137,23 @@ async def optional_basic_auth(request: Request, call_next):
         response = await call_next(request)
         return _with_no_store_headers(path, response)
 
-    if authenticate_basic_header(request.headers.get("authorization", "")):
+    session_user = current_user_from_session_cookie(request.cookies.get("xconsole_session"))
+    if session_user:
         response = await call_next(request)
+        return _with_no_store_headers(path, response)
+
+    auth_user = authenticate_basic_header(request.headers.get("authorization", ""))
+    if auth_user:
+        response = await call_next(request)
+        secure_cookie = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        response.set_cookie(
+            "xconsole_session",
+            issue_session_cookie(str(auth_user.get("username") or "")),
+            httponly=True,
+            samesite="lax",
+            secure=secure_cookie,
+            path="/",
+        )
         return _with_no_store_headers(path, response)
 
     return Response(
