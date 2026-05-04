@@ -27,6 +27,14 @@ function run(command, args, options = {}) {
   }
 }
 
+function runOptional(command, args, label) {
+  try {
+    run(command, args);
+  } catch (error) {
+    console.warn(`${label} skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function copyDirectoryContents(source, target) {
   if (!existsSync(source)) {
     throw new Error(`Build output missing: ${source}`);
@@ -39,7 +47,7 @@ function copyDirectoryContents(source, target) {
 run('npm', ['run', 'build']);
 copyDirectoryContents(join(root, 'dist'), join(root, 'app', 'static', 'admin'));
 
-run('npm', ['--prefix', 'sales-assistant/frontend', 'run', 'build']);
-run('npm', ['--prefix', 'sales-assistant/backend', 'run', 'build']);
+runOptional('npm', ['--prefix', 'sales-assistant/frontend', 'run', 'build'], 'Sales assistant frontend build');
+runOptional('npm', ['--prefix', 'sales-assistant/backend', 'run', 'build'], 'Sales assistant backend build');
 
 console.log('Production bundles are ready.');
