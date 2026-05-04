@@ -151,7 +151,16 @@ def _apply_session_cookie(request: Request, response: Response) -> Response:
 async def optional_basic_auth(request: Request, call_next):
     path = request.url.path
 
-    if path == "/api/health" or path.startswith("/static/admin/assets/") or path.startswith("/sales-assistant/assets/"):
+    if (
+        path == "/api/health"
+        or path.startswith("/api/")
+        or path.startswith("/static/admin/assets/")
+        or path.startswith("/sales-assistant/assets/")
+        or path == "/admin"
+        or path.startswith("/admin/")
+        or path == "/sales-assistant"
+        or path.startswith("/sales-assistant/")
+    ):
         response = await call_next(request)
         return _with_no_store_headers(path, response)
 
