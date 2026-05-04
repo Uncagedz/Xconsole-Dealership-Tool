@@ -1204,7 +1204,7 @@ class Lister:
             return False
         time.sleep(self.field_wait_seconds)
         values = option_values or [clean_expected]
-        if not self._select_option(values):
+        if not self._select_option_or_keyboard(clickable, values):
             if required:
                 raise RuntimeError(
                     json.dumps(
@@ -2668,15 +2668,17 @@ class Lister:
             transmission_value,
             option_values=[transmission_value or "", "Automatic", "Manual"],
         )
-        self._set_field_value(
+        self._set_verified_dropdown_value(
             ["exterior color", "exterior"],
             exterior_color,
             option_values=[exterior_color or ""],
+            required=bool(exterior_color),
         )
-        self._set_field_value(
+        self._set_verified_dropdown_value(
             ["interior color", "interior"],
             interior_color,
             option_values=[interior_color or ""],
+            required=False,
         )
         self._ensure_checkbox_checked(["clean title", "this vehicle has a clean title"])
         self._set_description_value(item.get("description"))
@@ -2691,7 +2693,6 @@ class Lister:
             {"terms": ["fuel type"], "expected": fuel_type_value, "include_textboxes": False},
             {"terms": ["transmission"], "expected": transmission_value, "include_textboxes": False},
             {"terms": ["exterior color", "exterior"], "expected": exterior_color, "include_textboxes": False},
-            {"terms": ["interior color", "interior"], "expected": interior_color, "include_textboxes": False},
         ]
         self._pending_publish_checkboxes = [
             {"terms": ["clean title", "this vehicle has a clean title"]},
