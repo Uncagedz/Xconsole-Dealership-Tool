@@ -435,6 +435,10 @@ function readableFacebookStatus(value: unknown): string {
   return text.length > 260 ? `${text.slice(0, 260)}...` : text;
 }
 
+function isIdleFacebookStage(value: unknown): boolean {
+  return String(value || '').trim() === 'No live Facebook publish running.';
+}
+
 function num(value: string | number | undefined | null): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (value === undefined || value === null) return null;
@@ -1256,8 +1260,11 @@ export function TavernaCommandCenter() {
   async function loadFacebookLiveStatus() {
     try {
       const payload = await requestJson<FacebookLiveStatus>('/api/facebook/live-status');
+      if (isIdleFacebookStage(payload.stage) && (postBusy || batchBusy)) {
+        return;
+      }
       setLiveStatus(payload);
-      if (payload.stage && payload.stage !== 'No live Facebook publish running.') {
+      if (payload.stage && !isIdleFacebookStage(payload.stage)) {
         const prefix = payload.vin ? `Facebook ${payload.vin}` : 'Facebook';
         const batch = payload.batch_total ? ` batch ${payload.batch_current || 0}/${payload.batch_total}` : '';
         const counts = payload.batch_total ? ` | posted ${payload.posted || 0} | failed ${payload.failed || 0}` : '';
@@ -1294,7 +1301,16 @@ export function TavernaCommandCenter() {
     }
     const orderedSelected = orderedPhotoIndexes.filter((index) => selectedPhotoIndexes.includes(index));
     const batchPrefix = options.batchTotal ? `Batch ${options.batchIndex}/${options.batchTotal}: ` : '';
-    setStatusText(`${batchPrefix}Preparing Facebook ${modeOverride} for ${targetVehicle?.title || clean}. VIN ${clean}. Importing photos and opening Marketplace automation...`);
+    const preparingStage = `Preparing Facebook ${modeOverride} for ${targetVehicle?.title || clean}. VIN ${clean}. Importing photos and opening Marketplace automation...`;
+    setStatusText(`${batchPrefix}${preparingStage}`);
+    setLiveStatus({
+      ok: true,
+      vin: clean,
+      title: targetVehicle?.title || clean,
+      stage: preparingStage,
+      type: 'main',
+      updated_at: new Date().toISOString(),
+    });
     setPostResult(null);
     const payload = await requestJson<OneClickPostPayload>('/api/facebook/post/from-inventory', {
       method: 'POST',
@@ -1313,7 +1329,8 @@ export function TavernaCommandCenter() {
     setPostResult(payload);
     if (!payload.post_result) {
       const currentLiveStatus = await requestJsonSafe<FacebookLiveStatus>('/api/facebook/live-status');
-      if (currentLiveStatus.ok && currentLiveStatus.value?.stage) {
+      if (currentLiveStatus.ok && currentLiveStatus.value?.stage && !isIdleFacebookStage(currentLiveStatus.value.stage)) {
+        setLiveStatus(currentLiveStatus.value);
         setStatusText(`${batchPrefix}${readableFacebookStatus(currentLiveStatus.value.stage)}`);
       } else {
         setStatusText(`${batchPrefix}Facebook returned no post result for ${clean}.`);
@@ -1324,6 +1341,16 @@ export function TavernaCommandCenter() {
       return payload;
     }
     const postState = payload.post_result?.marketplace_status || (payload.post_result?.live_success ? 'live' : 'needs_review');
+    setLiveStatus({
+      ok: Boolean(payload.post_result?.live_success),
+      vin: clean,
+      title: targetVehicle?.title || clean,
+      stage: payload.post_result?.live_success
+        ? 'Marketplace listing confirmed.'
+        : payload.post_result?.live_detail || `${titleCaseStatus(postState)} for ${clean}.`,
+      type: payload.post_result?.live_success ? 'success' : postState,
+      updated_at: new Date().toISOString(),
+    });
     setStatusText(
       payload.post_result?.live_success
         ? `${batchPrefix}Posted live ${clean}`
