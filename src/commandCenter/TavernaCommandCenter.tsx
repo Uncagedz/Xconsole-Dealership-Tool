@@ -781,6 +781,9 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   if (parseError) {
     throw new Error(`Response parsing failed for ${target}: ${parseError}`);
   }
+  if (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload as Record<string, unknown>).length === 0) {
+    throw new Error(`Request for ${target} returned an empty JSON object.`);
+  }
   return payload as T;
 }
 
@@ -1308,6 +1311,18 @@ export function TavernaCommandCenter() {
       }),
     });
     setPostResult(payload);
+    if (!payload.post_result) {
+      const currentLiveStatus = await requestJsonSafe<FacebookLiveStatus>('/api/facebook/live-status');
+      if (currentLiveStatus.ok && currentLiveStatus.value?.stage) {
+        setStatusText(`${batchPrefix}${readableFacebookStatus(currentLiveStatus.value.stage)}`);
+      } else {
+        setStatusText(`${batchPrefix}Facebook returned no post result for ${clean}.`);
+      }
+      if (options.refreshAfter !== false) {
+        await refresh();
+      }
+      return payload;
+    }
     const postState = payload.post_result?.marketplace_status || (payload.post_result?.live_success ? 'live' : 'needs_review');
     setStatusText(
       payload.post_result?.live_success
