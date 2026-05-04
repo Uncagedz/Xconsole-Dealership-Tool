@@ -55,44 +55,39 @@ class Lister:
         self.marketplace_vehicle_url = "https://www.facebook.com/marketplace/create/vehicle"
         self._vehicle_form_verified_at = 0.0
         self._pending_listing_title = ""
-        chrome_options = webdriver.ChromeOptions()
-        prefs = {"profile.default_content_setting_values.notifications": 2}
-        chrome_options.add_experimental_option("prefs", prefs)
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-        chrome_options.add_argument(f"--user-data-dir={self.profile_dir}")
-        chrome_options.add_argument("--profile-directory=Default")
-        chrome_options.add_argument("--disable-notifications")
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-background-networking")
-        chrome_options.add_argument("--remote-debugging-port=0")
-        chrome_options.page_load_strategy = "eager"
-        headless = (
+        self.headless = (
             not _running_on_windows()
             or os.getenv("FACEBOOK_HEADLESS", "").strip().lower() in {"1", "true", "yes"}
         )
-        if headless:
-            chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--disable-software-rasterizer")
-            chrome_options.add_argument("--window-size=1600,1200")
-        else:
-            chrome_options.add_argument("--start-maximized")
         self.profile_dir.mkdir(parents=True, exist_ok=True)
 
         chrome_binary = self._find_chrome_binary()
-        if chrome_binary:
-            chrome_options.binary_location = chrome_binary
 
         driver_path = self._find_chromedriver()
         if not driver_path:
             raise FileNotFoundError("Missing ChromeDriver. Set CHROMEDRIVER_PATH or install chromedriver.")
 
         chrome_service = Service(executable_path=str(driver_path))
-        self.driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
+        try:
+            self.driver = webdriver.Chrome(
+                service=chrome_service,
+                options=self._build_chrome_options(self.profile_dir, chrome_binary),
+            )
+        except Exception:
+            if not self.headless or _running_on_windows():
+                raise
+            fallback_dir = (self.profile_dir.parent / "facebook_auth_profile_headless").resolve()
+            try:
+                if fallback_dir.exists():
+                    shutil.rmtree(fallback_dir, ignore_errors=True)
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                raise
+            self.profile_dir = fallback_dir
+            self.driver = webdriver.Chrome(
+                service=chrome_service,
+                options=self._build_chrome_options(self.profile_dir, chrome_binary),
+            )
         self.driver.set_page_load_timeout(int(_env_float("FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 18)))
         self.driver.implicitly_wait(_env_float("FACEBOOK_IMPLICIT_WAIT_SECONDS", 1.0))
         try:
@@ -102,6 +97,33 @@ class Lister:
             )
         except Exception:
             pass
+
+    def _build_chrome_options(self, profile_dir, chrome_binary):
+        chrome_options = webdriver.ChromeOptions()
+        prefs = {"profile.default_content_setting_values.notifications": 2}
+        chrome_options.add_experimental_option("prefs", prefs)
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option("useAutomationExtension", False)
+        chrome_options.add_argument(f"--user-data-dir={Path(profile_dir).resolve()}")
+        chrome_options.add_argument("--profile-directory=Default")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-background-networking")
+        chrome_options.add_argument("--remote-debugging-port=0")
+        chrome_options.page_load_strategy = "eager"
+        if self.headless:
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--disable-software-rasterizer")
+            chrome_options.add_argument("--window-size=1600,1200")
+        else:
+            chrome_options.add_argument("--start-maximized")
+        if chrome_binary:
+            chrome_options.binary_location = chrome_binary
+        return chrome_options
 
     def _wait_for_page_ready(self, seconds: float) -> None:
         wait_seconds = max(0.2, float(seconds or 0.0))

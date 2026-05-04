@@ -84,6 +84,23 @@ def _find_chromedriver(drivers_dir: Path) -> Path | None:
     return None
 
 
+def _set_linux_chrome_defaults() -> None:
+    if _running_on_windows():
+        return
+    if not os.getenv("CHROME_BINARY"):
+        for command in ("chromium", "chromium-browser", "google-chrome", "chrome"):
+            resolved = shutil.which(command)
+            if resolved:
+                os.environ["CHROME_BINARY"] = resolved
+                break
+    if not os.getenv("CHROMEDRIVER_PATH"):
+        for command in ("chromedriver", "chromium-driver"):
+            resolved = shutil.which(command)
+            if resolved:
+                os.environ["CHROMEDRIVER_PATH"] = resolved
+                break
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Publish a Facebook Marketplace listing via recovered lister.")
     parser.add_argument("--payload", required=True, help="Path to a JSON payload file.")
@@ -162,6 +179,7 @@ def main() -> int:
     original_cwd = Path.cwd()
     lister = None
     try:
+        _set_linux_chrome_defaults()
         runtime_dir = root / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         session_state = ensure_runtime_session(root, force_restore=False)
