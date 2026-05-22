@@ -3013,7 +3013,15 @@ def _extract_inventory_dicts_from_payload(payload: Any) -> list[dict[str, Any]]:
     return candidates
 
 
-def _extract_inventory_dicts_from_html(html_text: str) -> tuple[list[dict[str, Any]], list[str]]:
+
+def _extract_inventory_dicts_from_html(html_text: str, source_url: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    """Extract inventory records from Dealer.com / Dealer Inspire style pages.
+
+    The old version only looked for JSON in script tags. Taverna/Dealer.com often
+    renders the visible inventory with client-side widgets, so the raw HTML can
+    contain either JSON bootstraps, vehicle-card markup, or only VDP links.
+    This parser tries all three before giving up.
+    """
     payloads: list[Any] = []
     notes: list[str] = []
 
@@ -3027,14 +3035,18 @@ def _extract_inventory_dicts_from_html(html_text: str) -> tuple[list[dict[str, A
         "__NEXT_DATA__",
         "__PRELOADED_STATE__",
         "__INITIAL_STATE__",
+        "__APOLLO_STATE__",
         "inventoryData",
         "inventoryState",
         "vehicleData",
+        "window.DDC",
+        "DDC.data",
+        "digitalData",
     ]
 
     for attrs, body in script_matches:
         attrs_lower = attrs.lower()
-        body_text = body.strip()
+        body_text = html.unescape(body.strip())
         if not body_text:
             continue
 
@@ -3046,6 +3058,7 @@ def _extract_inventory_dicts_from_html(html_text: str) -> tuple[list[dict[str, A
             except Exception:
                 pass
 
+        # Common JS assignment payloads.
         for token in assignment_tokens:
             if token not in body_text:
                 continue
@@ -3062,11 +3075,134 @@ def _extract_inventory_dicts_from_html(html_text: str) -> tuple[list[dict[str, A
             except Exception:
                 continue
 
+        # Dealer widgets sometimes inline arrays/objects without a stable global.
+        if any(needle in body_text.lower() for needle in ("vin", "stocknumber", "internetprice", "vehiclecard", "inventory")):
+            for json_block in re.findall(r"(\{[^{}]{0,4000}(?:vin|VIN|stockNumber|internetPrice|salePrice|vehicleName)[\s\S]{0,4000}?\})", body_text):
+                try:
+                    payloads.append(json.loads(json_block))
+                except Exception:
+                    continue
+
     records: list[dict[str, Any]] = []
     for payload in payloads:
         records.extend(_extract_inventory_dicts_from_payload(payload))
 
+    # HTML/card fallback for pages where JSON bootstraps are stripped or empty.
+    html_records: list[dict[str, Any]] = []
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+
+            # Find likely vehicle cards first.
+            card_selectors = [
+                "[data-vin]",
+                "[data-vehicle-vin]",
+                "[data-stock]",
+                "[class*='vehicle-card']",
+                "[class*='inventory-listing']",
+                "[class*='vehicle-listing']",
+                "[class*='inventory-item']",
+                "[class*='hproduct']",
+            ]
+            candidate_cards = []
+            for selector in card_selectors:
+                candidate_cards.extend(soup.select(selector))
+
+            # If cards are not available, build records from VDP links.
+            vdp_links = soup.find_all(
+                "a",
+                href=re.compile(r"/(?:used|new|certified)/.*\.htm|VehicleDetails|vin=|stock=", re.I),
+            )
+
+            seen_cards: set[int] = set()
+            for link in vdp_links:
+                card = None
+                for parent in [link] + list(link.parents)[:6]:
+                    text_value = parent.get_text(" ", strip=True) if hasattr(parent, "get_text") else ""
+                    if re.search(r"\b(?:19|20)\d{2}\b", text_value) and (
+                        re.search(r"\$\s?[0-9][0-9,]{2,}", text_value) or re.search(r"\b[A-HJ-NPR-Z0-9]{17}\b", text_value.upper())
+                    ):
+                        card = parent
+                        break
+                if card is not None and id(card) not in seen_cards:
+                    candidate_cards.append(card)
+                    seen_cards.add(id(card))
+
+            seen_detail_urls: set[str] = set()
+            for card in candidate_cards:
+                try:
+                    text_value = html.unescape(card.get_text(" ", strip=True))
+                    if not text_value:
+                        continue
+                    href = ""
+                    link = card.find("a", href=re.compile(r"/(?:used|new|certified)/.*\.htm|VehicleDetails|vin=|stock=", re.I))
+                    if link is not None:
+                        href = str(link.get("href") or "").strip()
+                    detail_url = urljoin(source_url or "", href) if href else None
+                    if detail_url:
+                        if detail_url.lower() in seen_detail_urls:
+                            continue
+                        seen_detail_urls.add(detail_url.lower())
+
+                    vin = (
+                        _vin_candidate(card.get("data-vin"))
+                        or _vin_candidate(card.get("data-vehicle-vin"))
+                        or _extract_vin_from_text(text_value)
+                    )
+                    stock = (
+                        str(card.get("data-stock") or card.get("data-stock-number") or "").strip()
+                        or (re.search(r"\b(?:stock|stk)\s*#?\s*:?\s*([A-Z0-9-]{3,24})\b", text_value, re.I).group(1)
+                            if re.search(r"\b(?:stock|stk)\s*#?\s*:?\s*([A-Z0-9-]{3,24})\b", text_value, re.I)
+                            else "")
+                    )
+                    title = ""
+                    title_node = card.find(["h1", "h2", "h3", "h4"])
+                    if title_node:
+                        title = title_node.get_text(" ", strip=True)
+                    if not title and link is not None:
+                        title = link.get_text(" ", strip=True) or str(link.get("title") or "")
+                    if not title:
+                        title_match = re.search(
+                            r"\b((?:19|20)\d{2}\s+(?:Chrysler|Dodge|Jeep|Ram|FIAT|Fiat|Kia|Toyota|Honda|Ford|Chevrolet|GMC|Nissan|Hyundai|Mazda|Volkswagen|Subaru|BMW|Mercedes-Benz|Audi|Lexus|Acura|Cadillac|Land Rover|Porsche|Volvo|Genesis|Tesla)[A-Za-z0-9 .'\-]{2,100})",
+                            text_value,
+                            flags=re.I,
+                        )
+                        title = title_match.group(1).strip() if title_match else ""
+
+                    price_match = re.search(r"\$\s?([0-9][0-9,]{2,})", text_value)
+                    mileage_match = re.search(r"\b([0-9][0-9,]{1,8})\s*(?:miles|mi)\b", text_value, re.I)
+                    images = []
+                    for image in card.find_all("img"):
+                        for attr in ("src", "data-src", "data-original", "data-lazy", "data-lazy-src"):
+                            src = str(image.get(attr) or "").strip()
+                            if src:
+                                images.append(urljoin(source_url or "", src))
+                                break
+
+                    if not (vin or title or detail_url):
+                        continue
+                    html_records.append(
+                        {
+                            "vin": vin or (_synthetic_vin_from_detail_url(detail_url) if detail_url else "UNKNOWN"),
+                            "title": title or vin or "Vehicle",
+                            "price": int(price_match.group(1).replace(",", "")) if price_match else None,
+                            "mileage": int(mileage_match.group(1).replace(",", "")) if mileage_match else None,
+                            "stock_number": stock or None,
+                            "detail_url": detail_url,
+                            "photos": _dedupe_urls(images),
+                            "status_label": "In Stock",
+                        }
+                    )
+                except Exception:
+                    continue
+        except Exception as exc:
+            notes.append(f"html_card_parse_error={exc}")
+
+    records.extend(html_records)
+
     notes.append(f"script_payloads={len(payloads)}")
+    notes.append(f"script_candidate_records={len(records) - len(html_records)}")
+    notes.append(f"html_candidate_records={len(html_records)}")
     notes.append(f"candidate_records={len(records)}")
     return records, notes
 
@@ -3820,88 +3956,73 @@ def _inventory_count_summary(items: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+
 def _fetch_live_inventory_records(*, source_url: str, timeout_seconds: int) -> dict[str, Any]:
-    with httpx.Client(
-        timeout=float(timeout_seconds),
-        follow_redirects=True,
-        headers={
-            "user-agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0.0.0 Safari/537.36"
-            ),
-            "accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-        },
-    ) as client:
-        response = client.get(source_url)
+    """Fetch and normalize live dealership inventory.
 
-    content_type = str(response.headers.get("content-type", "")).lower()
-    diagnostics: list[str] = [f"http_status={response.status_code}", f"content_type={content_type}"]
+    Fixes:
+    - Taverna/Dealer.com pages are often JS-rendered, so direct HTML may return
+      a shell or a few placeholder records. We now fall back when the direct
+      parse is weak, not only when it is zero.
+    - normalized_proxy was previously referenced before assignment if the proxy
+      fetch failed.
+    - We choose the best result among direct HTML, proxy markdown, and browser
+      rendering instead of accepting a bad first parse.
+    """
+    diagnostics: list[str] = []
+    raw_records: list[dict[str, Any]] = []
+    normalized: list[dict[str, Any]] = []
+    normalized_proxy: list[dict[str, Any]] = []
+    normalized_browser: list[dict[str, Any]] = []
+    fetched_at = datetime.now(timezone.utc).isoformat()
 
-    if response.status_code >= 400:
-        if response.status_code in {401, 403}:
-            normalized_proxy: list[dict[str, Any]] = []
-            try:
-                browser_payload = _fetch_live_inventory_records_via_browser_html(
-                    source_url=source_url,
-                    timeout_seconds=timeout_seconds,
-                )
-                diagnostics.extend(list(browser_payload.get("diagnostics") or []))
-                browser_records = list(browser_payload.get("items") or [])
-                normalized_browser = _normalize_inventory_records(browser_records, source_url=source_url)
-                diagnostics.append(f"browser_normalized_records={len(normalized_browser)}")
-                if normalized_browser:
-                    return {
-                        "source_url": source_url,
-                        "fetched_at": browser_payload.get("fetched_at") or datetime.now(timezone.utc).isoformat(),
-                        "items": normalized_browser,
-                        "items_count": len(normalized_browser),
-                        "diagnostics": diagnostics,
-                    }
-            except Exception as exc:
-                diagnostics.append(f"browser_error={exc}")
-
-            try:
-                proxy_payload = _fetch_live_inventory_records_via_proxy_markdown(
-                    source_url=source_url,
-                    timeout_seconds=timeout_seconds,
-                )
-                diagnostics.extend(list(proxy_payload.get("diagnostics") or []))
-                proxy_records = list(proxy_payload.get("items") or [])
-                normalized_proxy = _normalize_inventory_records(proxy_records, source_url=source_url)
-                diagnostics.append(f"normalized_records={len(normalized_proxy)}")
-            except Exception as exc:
-                diagnostics.append(f"proxy_error={exc}")
-            if normalized_proxy:
-                return {
-                    "source_url": source_url,
-                    "fetched_at": datetime.now(timezone.utc).isoformat(),
-                    "items": normalized_proxy,
-                    "items_count": len(normalized_proxy),
-                    "diagnostics": diagnostics,
-                }
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Dealership inventory source returned a non-success HTTP status",
-                "source_url": source_url,
-                "status_code": response.status_code,
-                "diagnostics": diagnostics,
+    try:
+        with httpx.Client(
+            timeout=float(timeout_seconds),
+            follow_redirects=True,
+            headers={
+                "user-agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+                "accept-language": "en-US,en;q=0.9",
+                "cache-control": "no-cache",
             },
-        )
+        ) as client:
+            response = client.get(source_url)
 
-    if "json" in content_type:
-        payload = response.json()
-        raw_records = _extract_inventory_dicts_from_payload(payload)
-        diagnostics.append(f"payload_records={len(raw_records)}")
-    else:
-        html_text = response.text
-        raw_records, html_notes = _extract_inventory_dicts_from_html(html_text)
-        diagnostics.extend(html_notes)
+        content_type = str(response.headers.get("content-type", "")).lower()
+        diagnostics.extend([f"http_status={response.status_code}", f"content_type={content_type}"])
 
-    normalized = _normalize_inventory_records(raw_records, source_url=source_url)
-    diagnostics.append(f"normalized_records={len(normalized)}")
-    if not normalized:
+        if response.status_code < 400:
+            if "json" in content_type:
+                payload = response.json()
+                raw_records = _extract_inventory_dicts_from_payload(payload)
+                diagnostics.append(f"payload_records={len(raw_records)}")
+            else:
+                html_text = response.text
+                raw_records, html_notes = _extract_inventory_dicts_from_html(html_text, source_url=source_url)
+                diagnostics.extend(html_notes)
+
+            normalized = _normalize_inventory_records(raw_records, source_url=source_url)
+            diagnostics.append(f"direct_normalized_records={len(normalized)}")
+        else:
+            diagnostics.append(f"direct_http_error={response.status_code}")
+    except Exception as exc:
+        diagnostics.append(f"direct_fetch_error={exc}")
+
+    # Direct raw HTML from Dealer.com can show only a rendered shell. Treat a
+    # tiny direct result as weak and continue to fallbacks.
+    try:
+        min_direct_records = int(os.getenv("DEALERSHIP_INVENTORY_MIN_DIRECT_RECORDS", "20") or "20")
+    except ValueError:
+        min_direct_records = 20
+
+    should_fallback = len(normalized) < min_direct_records
+
+    if should_fallback:
         try:
             proxy_payload = _fetch_live_inventory_records_via_proxy_markdown(
                 source_url=source_url,
@@ -3910,17 +4031,9 @@ def _fetch_live_inventory_records(*, source_url: str, timeout_seconds: int) -> d
             diagnostics.extend(list(proxy_payload.get("diagnostics") or []))
             proxy_records = list(proxy_payload.get("items") or [])
             normalized_proxy = _normalize_inventory_records(proxy_records, source_url=source_url)
-            diagnostics.append(f"fallback_proxy_normalized_records={len(normalized_proxy)}")
-            if len(normalized_proxy) >= 50:
-                return {
-                    "source_url": source_url,
-                    "fetched_at": proxy_payload.get("fetched_at") or datetime.now(timezone.utc).isoformat(),
-                    "items": normalized_proxy,
-                    "items_count": len(normalized_proxy),
-                    "diagnostics": diagnostics,
-                }
+            diagnostics.append(f"proxy_normalized_records={len(normalized_proxy)}")
         except Exception as exc:
-            diagnostics.append(f"fallback_proxy_error={exc}")
+            diagnostics.append(f"proxy_error={exc}")
 
         try:
             browser_payload = _fetch_live_inventory_records_via_browser_html(
@@ -3930,24 +4043,28 @@ def _fetch_live_inventory_records(*, source_url: str, timeout_seconds: int) -> d
             diagnostics.extend(list(browser_payload.get("diagnostics") or []))
             browser_records = list(browser_payload.get("items") or [])
             normalized_browser = _normalize_inventory_records(browser_records, source_url=source_url)
-            diagnostics.append(f"fallback_browser_normalized_records={len(normalized_browser)}")
-            best_items = normalized_browser if len(normalized_browser) > len(normalized_proxy) else normalized_proxy
-            if best_items:
-                return {
-                    "source_url": source_url,
-                    "fetched_at": browser_payload.get("fetched_at") or datetime.now(timezone.utc).isoformat(),
-                    "items": best_items,
-                    "items_count": len(best_items),
-                    "diagnostics": diagnostics,
-                }
+            diagnostics.append(f"browser_normalized_records={len(normalized_browser)}")
         except Exception as exc:
-            diagnostics.append(f"fallback_browser_error={exc}")
+            diagnostics.append(f"browser_error={exc}")
+
+    candidates = [
+        ("direct", normalized),
+        ("proxy", normalized_proxy),
+        ("browser", normalized_browser),
+    ]
+    best_source, best_items = max(candidates, key=lambda row: len(row[1]))
+    diagnostics.append(f"selected_source={best_source}")
+    diagnostics.append(f"selected_records={len(best_items)}")
+
+    if not best_items and diagnostics and any("http_status=4" in item or "direct_http_error=4" in item for item in diagnostics):
+        # Preserve the useful diagnostics but avoid throwing before fallbacks are tried.
+        diagnostics.append("no_inventory_records_after_all_fallbacks")
 
     return {
         "source_url": source_url,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "items": normalized,
-        "items_count": len(normalized),
+        "fetched_at": fetched_at,
+        "items": best_items,
+        "items_count": len(best_items),
         "diagnostics": diagnostics,
     }
 
@@ -4181,6 +4298,7 @@ def _inventory_source_status() -> dict[str, Any]:
     }
 
 
+
 def _sync_live_inventory(
     *,
     source_url: str | None,
@@ -4198,6 +4316,7 @@ def _sync_live_inventory(
                 source_url=target_source,
                 timeout_seconds=timeout_seconds,
             )
+            # Keep payloads even if zero so diagnostics tell the truth.
             fetched_payloads.append(fetched)
             diagnostics.extend([f"{target_source}: {item}" for item in list(fetched.get("diagnostics") or [])])
         except HTTPException as exc:
@@ -4234,6 +4353,7 @@ def _sync_live_inventory(
         "skipped": 0,
         "with_carfax": 0,
         "with_report_facts": 0,
+        "with_discovered_link": 0,
         "errors": 0,
     }
     diagnostics.append(
@@ -4251,6 +4371,22 @@ def _sync_live_inventory(
             fetched_at=fetched_at,
             items=merged_items,
             diagnostics=diagnostics,
+        )
+    elif persist and not merged_items:
+        # Do not overwrite a good existing cache with zero records. Save the
+        # failed diagnostics to meta so the admin screen can show why sync failed.
+        _safe_write_json(
+            INVENTORY_LIVE_META_PATH,
+            {
+                "source_url": joined_source,
+                "fetched_at": fetched_at,
+                "items_count": 0,
+                "diagnostics": diagnostics,
+                "errors": errors,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "persisted": False,
+                "reason": "No website inventory records parsed; existing live cache was preserved.",
+            },
         )
 
     return {
@@ -12235,4 +12371,3 @@ async def bank_brain_docs_upload(
         "rebuild": rebuild_result,
         "status": _routeone_docs_status(),
     }
-
